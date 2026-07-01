@@ -1,0 +1,83 @@
+# Checkpoints, data, and large artifacts
+ckpts/
+data/
+outputs/
+results/
+runs/
+wandb/
+multirun/
+
+*.ckpt
+*.pth
+*.pt
+*.hdf5
+*.h5
+*.pkl
+*.npz
+*.npy
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Testing / coverage
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+nul
+
+# Logs and PDFs
+*.log
+logs/
+*.pdf
+
+# Hydra output
+.hydra/
+${now:/}

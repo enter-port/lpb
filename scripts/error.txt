@@ -1,0 +1,82 @@
+Process Worker<AsyncVectorEnv>-0:
+Traceback (most recent call last):
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/multiprocessing/process.py", line 315, in _bootstrap
+    self.run()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/diffusion_policy/gym_util/async_vector_env.py", line 617, in _worker_shared_memory
+    env = env_fn()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/gym/vector/utils/misc.py", line 22, in __call__
+    return self.fn()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/diffusion_policy/env_runner/robomimic_image_runner.py", line 90, in env_fn
+    robomimic_env = create_env(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/diffusion_policy/env_runner/robomimic_image_runner.py", line 33, in create_env
+    env = EnvUtils.create_env_from_metadata(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robomimic/utils/env_utils.py", line 218, in create_env_from_metadata
+    env = create_env(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robomimic/utils/env_utils.py", line 169, in create_env
+    env = env_class(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robomimic/envs/env_robosuite.py", line 82, in __init__
+    self.env = robosuite.make(self._env_name, **kwargs)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/base.py", line 40, in make
+    return REGISTERED_ENVS[env_name](*args, **kwargs)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/manipulation/two_arm_transport.py", line 198, in __init__
+    super().__init__(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/manipulation/manipulation_env.py", line 162, in __init__
+    super().__init__(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/robot_env.py", line 214, in __init__
+    super().__init__(
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/base.py", line 143, in __init__
+    self._reset_internal()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/manipulation/two_arm_transport.py", line 554, in _reset_internal
+    super()._reset_internal()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/robot_env.py", line 510, in _reset_internal
+    super()._reset_internal()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/environments/base.py", line 299, in _reset_internal
+    render_context = MjRenderContextOffscreen(self.sim, device_id=self.render_gpu_device_id)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/utils/binding_utils.py", line 210, in __init__
+    super().__init__(sim, offscreen=True, device_id=device_id, max_width=max_width, max_height=max_height)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/utils/binding_utils.py", line 78, in __init__
+    self.gl_ctx = GLContext(max_width=max_width, max_height=max_height, device_id=self.device_id)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/renderers/context/egl_context.py", line 136, in __init__
+    self._context = EGL.eglCreateContext(EGL_DISPLAY, config, EGL.EGL_NO_CONTEXT, None)
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/OpenGL/platform/baseplatform.py", line 415, in __call__
+    return self( *args, **named )
+  File "src/errorchecker.pyx", line 58, in OpenGL_accelerate.errorchecker._ErrorChecker.glCheckError
+OpenGL.raw.EGL._errors.EGLError: EGLError(
+        err = EGL_BAD_ALLOC,
+        baseOperation = eglCreateContext,
+        cArguments = (
+                <OpenGL._opaque.EGLDisplay_pointer object at 0x7f9d54141bc0>,
+                <OpenGL._opaque.EGLConfig_pointer object at 0x7f9d54141ac0>,
+                <OpenGL._opaque.EGLContext_pointer object at 0x7f9d943aa340>,
+                None,
+        ),
+        result = <OpenGL._opaque.EGLContext_pointer object at 0x7f9d54112840>
+)
+Exception ignored in: <function EGLGLContext.__del__ at 0x7f9d8c3e1a60>
+Traceback (most recent call last):
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/renderers/context/egl_context.py", line 155, in __del__
+    self.free()
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/renderers/context/egl_context.py", line 146, in free
+    if self._context:
+AttributeError: 'EGLGLContext' object has no attribute '_context'
+Exception ignored in: <function MjRenderContext.__del__ at 0x7f9d8c3e1c10>
+Traceback (most recent call last):
+  File "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/miniconda3/envs/lpb/lib/python3.9/site-packages/robosuite/utils/binding_utils.py", line 198, in __del__
+    self.con.free()
+AttributeError: 'MjRenderContextOffscreen' object has no attribute 'con'
+Error executing job with overrides: ['training.seed=42', 'training.device=cuda:0']
+Error in call to target 'diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner':
+BrokenPipeError(32, 'Broken pipe')
+full_key: task.env_runner
+
+https://drive.google.com/drive/folders/1LdI1eUe_95O7XT9uYLAnx9KC4UNSSF5x
+
+需要。要求如下：1.ckpt以数字命名，如lpb/data/outputs/2026.06.05/07.27.48_train_diffusion_unet_hybrid_transp
+ort_image/checkpoints/200.ckpt 在脚本最开始写入开始ckpt路径 
+开始编号（如200，与开始路径中的文件名一致），delta_n(使用的ckpt间隔，如50，就加载200,250,300等)，结束编号（如
+300）和每个ckpt的rollout条数（如30）。随后对每个base policy 
+ckpt进行对应次数的rollout并保存所有的轨迹数据，最后存到hdf5中  2.注意这里我们只使用base 
+policy进行rollout，你上面所说的改造eval_test_time_optimization.py会有问题 因为他还是用的dynamics 
+model。我们收集的数据就是用来训练dynamics model的。 

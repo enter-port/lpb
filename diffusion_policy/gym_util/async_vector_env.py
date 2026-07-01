@@ -89,6 +89,12 @@ class AsyncVectorEnv(VectorEnv):
         daemon=True,
         worker=None,
     ):
+        # Use 'spawn' instead of default 'fork' to avoid EGL_BAD_ALLOC:
+        # fork inherits parent's EGL display connection and OpenGL objects,
+        # but EGL contexts are OS-level resources that cannot be shared.
+        # Child process then fails at eglCreateContext with EGL_BAD_ALLOC.
+        if context is None:
+            context = 'spawn'
         ctx = mp.get_context(context)
         self.env_fns = env_fns
         self.shared_memory = shared_memory
