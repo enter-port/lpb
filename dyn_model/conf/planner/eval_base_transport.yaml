@@ -1,0 +1,32 @@
+# Config for base-policy-only evaluation (NO dynamics model, NO guidance).
+# This mirrors eval_transport.yaml but drops all planner/dynamics fields.
+
+hydra:
+  run:
+    dir: .
+
+# Base policy checkpoint (same one used by eval_test_time_optimization)
+policy_checkpoint: 'data/transport/model_ckpt/base_policy/checkpoints/270.ckpt'
+
+# Expert dataset — provides env metadata so the runner can build environments.
+# Also used to override the stale paths baked into the .ckpt (see CLAUDE.md §6.1).
+demo_dataset_path: 'data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'
+
+# Evaluation settings (keep these identical to eval_transport.yaml for a fair
+# base-vs-LPB comparison: same seeds, same n_action_steps).
+n_test: 50
+test_start_seed: 100000
+n_action_steps: 15
+
+# Number of parallel environments. The task config default is 28; lower this
+# (e.g. 14) if you see GPU OOM during offscreen rendering.
+n_envs: 28
+
+# Output
+output_dir: 'data/base_transport_test'
+device: "cuda"
+
+# Use the PARALLEL runner — it calls policy.predict_action() which needs no
+# planner. (The sequential runner calls predict_action_dyn_guided() which
+# would crash without a planner.)
+env_runner_target: 'diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner'
