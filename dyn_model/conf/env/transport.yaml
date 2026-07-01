@@ -3,8 +3,8 @@ name: transport
 dataset_class: dyn_model.datasets.robomimic_dset.RobomimicImageDynamicsModelDataset
 
 # Dataset paths
-train_data_path: /store/real/zhanyis/diffusion_policy/data/debug_transport_04_02_11_08_18_baseline_ckpt_280_save_data_45_60/eval_results.hdf5
-val_data_path: /store/real/zhanyis/diffusion_policy/data/debug_transport_04_02_11_08_18_baseline_ckpt_280_save_data_45_60/eval_results.hdf5
+train_data_path: /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/transport/data/my_rollout/transport_rollout_and_demo.hdf5
+val_data_path: /inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/transport/data/my_rollout/transport_val.hdf5
 
 # Dataset parameters
 view_names: ['robot0_eye_in_hand_image', 'robot1_eye_in_hand_image', 'shouldercamera0_image', 'shouldercamera1_image']
@@ -24,7 +24,7 @@ action_emb_dim: 330
 proprio_emb_dim: 32
 
 # Policy checkpoint
-policy_ckpt_path: "/store/real/zhanyis/diffusion_policy/data/outputs/2025.04.02/11.08.18_train_diffusion_unet_hybrid_transport_image/checkpoints/280.ckpt"
+policy_ckpt_path: "/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/outputs/base_policy_6_15/checkpoints/270.ckpt"
 
 # Shape meta for observations
 shape_obs:

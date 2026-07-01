@@ -180,7 +180,7 @@ task:
   dataset:
     _target_: diffusion_policy.dataset.robomimic_replay_image_dataset.RobomimicReplayImageDataset
     abs_action: true
-    dataset_path: path_to_dataset
+    dataset_path: "data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5"
     horizon: 32
     n_obs_steps: 2
     pad_after: 7
@@ -236,13 +236,13 @@ task:
           type: rgb
     use_cache: true
     val_ratio: 0.0
-  dataset_path: path_to_dataset
+  dataset_path: data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5
   dataset_type: mh
   env_runner:
     _target_: diffusion_policy.env_runner.robomimic_image_runner.RobomimicImageRunner
     abs_action: true
     crf: 22
-    dataset_path: path_to_dataset
+    dataset_path: data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5
     fps: 10
     max_steps: 700
     n_action_steps: 15
@@ -355,7 +355,7 @@ task:
   task_name: transport
 task_name: transport_image
 training:
-  checkpoint_every: 20
+  checkpoint_every: 10
   debug: false
   device: cuda:0
   gradient_accumulate_every: 1
@@ -363,9 +363,9 @@ training:
   lr_warmup_steps: 500
   max_train_steps: null
   max_val_steps: null
-  num_epochs: 3000
+  num_epochs: 300
   resume: true
-  rollout_every: 20
+  rollout_every: 50
   sample_every: 5
   seed: 42
   tqdm_interval_sec: 1.0

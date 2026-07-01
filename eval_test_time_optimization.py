@@ -66,6 +66,9 @@ def main(cfg: DictConfig):
     normalizer_path = os.path.join(normalizer_dir, 'normalizer.pth')
     policy.normalizer.load_state_dict(torch.load(normalizer_path))
     policy.normalizer.to(device)
+    
+    payload['cfg'].task.dataset.dataset_path = cfg.demo_dataset_path
+    cfg_task_env_runner.task.env_runner.dataset_path = cfg.demo_dataset_path
 
     policy.initialize_planner(
         planner_target=cfg.planner_target,

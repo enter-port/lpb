@@ -1,4 +1,4 @@
-name: lpb
+name: lpb2
 channels:
   - pytorch
   - pytorch3d
@@ -50,16 +50,16 @@ dependencies:
   - llvm-openmp=14
   # trick to force reinstall imagecodecs via pip
   - imagecodecs==2022.8.8
-  - pip:
-    - ray[default,tune]==2.2.0
-    # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
-    - free-mujoco-py==2.1.6
-    - pygame==2.1.2
-    - pybullet-svl==3.1.6.4
-    - robosuite==1.4.1
-    - robomimic==0.3.0
-    - pytorchvideo==0.1.5
-    # pip package required for jpeg-xl
-    - imagecodecs==2022.9.26
-    - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
-    - dm-control==1.0.9
+  # - pip:
+  #   - ray[default,tune]==2.2.0
+  #   # requires mujoco py dependencies libosmesa6-dev libgl1-mesa-glx libglfw3 patchelf
+  #   - free-mujoco-py==2.1.6
+  #   - pygame==2.1.2
+  #   - pybullet-svl==3.1.6.4
+  #   - robosuite==1.4.1
+  #   - robomimic==0.3.0
+  #   - pytorchvideo==0.1.5
+  #   # pip package required for jpeg-xl
+  #   - imagecodecs==2022.9.26
+  #   - r3m @ https://github.com/facebookresearch/r3m/archive/b2334e726887fa0206962d7984c69c5fb09cceab.tar.gz
+  #   - dm-control==1.0.9
