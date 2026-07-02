@@ -6,11 +6,11 @@ hydra:
     dir: .
 
 # Base policy checkpoint (same one used by eval_test_time_optimization)
-policy_checkpoint: 'data/transport/model_ckpt/base_policy/checkpoints/270.ckpt'
+policy_checkpoint: '/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/outputs/base_policy_6_15/checkpoints/270.ckpt'
 
 # Expert dataset — provides env metadata so the runner can build environments.
 # Also used to override the stale paths baked into the .ckpt (see CLAUDE.md §6.1).
-demo_dataset_path: 'data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'
+demo_dataset_path: '/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'
 
 # Evaluation settings (keep these identical to eval_transport.yaml for a fair
 # base-vs-LPB comparison: same seeds, same n_action_steps).
@@ -23,7 +23,7 @@ n_action_steps: 15
 n_envs: 28
 
 # Output
-output_dir: 'data/base_transport_test'
+output_dir: 'data/base_transport_test_2'
 device: "cuda"
 
 # Use the PARALLEL runner — it calls policy.predict_action() which needs no
