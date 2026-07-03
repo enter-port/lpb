@@ -1,6 +1,7 @@
 # Checkpoints, data, and large artifacts
 ckpts/
 data/
+eval_results/
 outputs/
 results/
 runs/
