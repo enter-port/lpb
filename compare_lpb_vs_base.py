@@ -693,6 +693,111 @@ def _render_video_frame(
     return out
 
 
+def _make_video(
+    driver_result: Dict,
+    overlay_result: Dict,
+    overlay_method: str,
+    env,
+    view_names: List[str],
+    cfg: DictConfig,
+    output_path: str,
+):
+    """Generate one MP4: driver's frames as background, overlay's eef trajectory projected.
+
+    Iterates over `driver_result['frames'][view][t]` (background images from
+    the driver rollout) and composes a side-by-side panel of all `view_names`
+    cameras, with the `overlay_result['eef_traj']` drawn on top via
+    `_render_video_frame`.
+
+    Frame dimensions:
+        Single panel: img_size * cfg.video_frame_scale on each side
+        (e.g. 140 * 2 = 280). For len(view_names)=2 cameras, the final frame
+        is (280, 560, 3) uint8. `macro_block_size=1` is passed to imageio so
+        ffmpeg does not force the width/height to multiples of 16 (560 and
+        280 are not multiples of 16).
+
+    Length mismatch handling: the driver rollout may have more or fewer
+    sampled steps than the overlay. We iterate `t in range(n_frames)` (driver
+    length) and cap the overlay step at `overlay_n - 1`. If
+    `overlay_n == 0` we skip the video entirely (nothing to draw).
+
+    imageio API (verified for imageio 2.22.0 + imageio-ffmpeg 0.4.7 in
+    conda_environment.yaml):
+        `imageio.v2.get_writer(path, fps=..., codec='libx264', quality=N,
+        macro_block_size=1)` is the supported v2 API on this version.
+        `quality` is a 0-10 scale (lower = higher quality); we use 8 per the
+        design spec. `macro_block_size=1` disables the default multiple-of-16
+        padding.
+
+    Memory: imageio writes frames incrementally via ffmpeg, so we never hold
+    the full video in memory — only one composed frame at a time (~470 KB for
+    280x560x3 uint8).
+
+    Cleanup: writer.close() runs in a finally block so a mid-loop exception
+    still flushes the partial file (or closes the ffmpeg subprocess cleanly).
+    """
+    import imageio.v2 as imageio  # v2 API for backward compat
+
+    n_frames = int(driver_result['n_samples'])
+    overlay_n = int(overlay_result['n_samples'])
+
+    if n_frames == 0:
+        print(f"[video] SKIP: driver has 0 frames ({output_path})")
+        return
+    if overlay_n == 0:
+        print(f"[video] SKIP: overlay has 0 samples, nothing to draw ({output_path})")
+        return
+
+    # img_size from driver frame H (frames are (T, H, W, 3) per _run_rollout).
+    # All views share the same H (Transport: 140), so we read from view 0.
+    img_size = int(driver_result['frames'][view_names[0]].shape[1])
+    out_h = img_size * cfg.video_frame_scale
+    out_w = img_size * cfg.video_frame_scale * len(view_names)
+
+    print(f"[video] writing {output_path}: {n_frames} frames, "
+          f"{len(view_names)} views side-by-side, {out_h}x{out_w}px")
+
+    writer = imageio.get_writer(
+        output_path,
+        fps=cfg.video_fps,
+        codec='libx264',
+        quality=8,
+        macro_block_size=1,
+    )
+
+    try:
+        for t in range(n_frames):
+            # Cap overlay step at last available index (handles driver outlasting overlay).
+            overlay_step = min(t, overlay_n - 1)
+            panels = []
+            for view in view_names:
+                bg = driver_result['frames'][view][t]
+                panel = _render_video_frame(
+                    bg_frame=bg,
+                    overlay_eef_world=overlay_result['eef_traj'],
+                    env=env,
+                    camera_name=view,
+                    current_step=overlay_step,
+                    total_overlay_steps=overlay_n,
+                    scale=cfg.video_frame_scale,
+                    overlay_method=overlay_method,
+                )
+                panels.append(panel)
+            # Horizontal stack: (out_h, out_w, 3). All panels are identical-shaped
+            # (out_h, out_h, 3) per _render_video_frame's contract.
+            frame = np.concatenate(panels, axis=1)
+            writer.append_data(frame)
+
+            if t % 20 == 0:
+                print(f"  [video] frame {t}/{n_frames}")
+    finally:
+        # Ensure the ffmpeg subprocess is closed even on exception so we don't
+        # leak a hung writer or leave the file half-flushed without close().
+        writer.close()
+
+    print(f"[video] wrote {output_path} ({n_frames} frames)")
+
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
 def main(cfg: DictConfig):
     print("=" * 60)
