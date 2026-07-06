@@ -530,6 +530,169 @@ def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
     return np.stack([px, py], axis=1)
 
 
+def _render_video_frame(
+    bg_frame: np.ndarray,
+    overlay_eef_world: np.ndarray,
+    env,
+    camera_name: str,
+    current_step: int,
+    total_overlay_steps: int,
+    scale: int,
+    overlay_method: str,  # 'lpb' or 'base'
+    img_size: int = 140,
+) -> np.ndarray:
+    """Compose one video frame: background image + overlay eef trajectory.
+
+    Background `bg_frame` is a uint8 (img_size, img_size, 3) RGB render from
+    `camera_name`. The `overlay_eef_world` array is shape (T, 2, 3) — T timesteps,
+    two robot arms, world xyz. We project every step to `camera_name` pixel
+    coords via `_project_to_camera`, then split into:
+        * "past"   = overlay[:current_step+1]   drawn solid, full alpha
+        * "future" = overlay[current_step+1:]   drawn dashed, alpha=0.35
+    Each arm gets a distinct marker ('o' for arm 0, 's' for arm 1) at the
+    `current_step` position so the two arms are visually distinguishable.
+
+    Color encodes time along the overlay trajectory (cmap depends on
+    `overlay_method`: 'lpb' -> plasma, 'base' -> viridis). No colorbar is
+    drawn (kept simple; the title annotates step index).
+
+    `scale` controls supersampling: output pixel size = img_size*scale.
+    E.g. img_size=140, scale=2 -> (280, 280, 3) uint8.
+
+    matplotlib API notes (server env has matplotlib=3.6.1 per
+    conda_environment.yaml):
+      - `FigureCanvasToBase.tostring_rgb()` is NOT deprecated in 3.6; it
+        was deprecated in 3.10. We use the more future-proof
+        `buffer_rgba()` + np.frombuffer + [..., :3] slice, which works on
+        3.6+ and avoids the deprecation entirely.
+      - LineCollection `linestyles=` accepts a single string ('-' or '--')
+        applied to ALL segments. The draft originally passed a 1-tuple
+        like `('-',)` which matplotlib interprets as a DashPattern tuple
+        and errors out. Fixed here by passing a plain string.
+      - `extent=[0, W, H, 0]` + `set_ylim(H, 0)` flips the imshow so the
+        pixel (0,0) is top-left, matching the projection convention in
+        `_project_to_camera` (px right, py down, origin top-left).
+
+    All matplotlib imports are inside the function because (a) we must set
+    the backend to 'Agg' before pyplot is first imported, and (b) it keeps
+    the top of this module importable on Windows (no matplotlib needed for
+    the static syntax check). The backend-set call is guarded so it only
+    runs once per process.
+    """
+    import matplotlib
+    matplotlib.use('Agg')  # headless; safe to call repeatedly
+    import matplotlib.pyplot as plt
+    from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
+
+    if overlay_method == 'lpb':
+        cmap_name = 'plasma'
+    elif overlay_method == 'base':
+        cmap_name = 'viridis'
+    else:
+        raise ValueError(
+            f"overlay_method must be 'lpb' or 'base'; got {overlay_method!r}")
+    cmap = plt.get_cmap(cmap_name)
+
+    # ---- project the entire overlay trajectory to this camera's pixels ----
+    # overlay_eef_world: (T, 2, 3) -> (T*2, 3) flat -> project -> (T, 2, 2)
+    n_total = int(overlay_eef_world.shape[0])
+    flat_pts = overlay_eef_world.reshape(n_total * 2, 3)
+    flat_px = _project_to_camera(flat_pts, env, camera_name, img_size=img_size)
+    all_px = flat_px.reshape(n_total, 2, 2)  # (T, 2 arms, 2 px)
+
+    # ---- figure setup: img_size*scale pixels ----
+    fig, ax = plt.subplots(
+        figsize=(img_size * scale / 100.0, img_size * scale / 100.0),
+        dpi=100,
+    )
+    # imshow with extent flips y so (0,0) is top-left, matching projection.
+    ax.imshow(bg_frame, extent=[0, img_size, img_size, 0])
+    ax.set_xlim(0, img_size)
+    ax.set_ylim(img_size, 0)  # reversed: top-left origin
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect('equal')
+
+    past_end = min(current_step + 1, n_total)
+    future_start = past_end
+    future_end = n_total
+
+    norm = Normalize(vmin=0, vmax=max(n_total - 1, 1))
+
+    def _draw_arm_segments(points_px: np.ndarray, base_indices: np.ndarray,
+                           linestyle: str, alpha: float):
+        """Draw both arms from `points_px` (T_seg, 2, 2).
+
+        Arm 0 uses linestyle as-is; arm 1 ALSO uses linestyle as-is. Earlier
+        draft tried to override to '--' for arm 1 but that conflicted with
+        the caller's linestyle arg. Both arms use the same linestyle here;
+        they are distinguishable by marker shape at `current_step`.
+
+        `base_indices` are the global step indices (for color mapping) that
+        correspond to rows of `points_px`.
+        """
+        for arm_idx in range(2):
+            pts = points_px[:, arm_idx]  # (T_seg, 2)
+            # skip points that failed projection (px < 0 sentinel)
+            valid = (pts[:, 0] >= 0) & (pts[:, 1] >= 0)
+            if valid.sum() < 2:
+                continue
+            seg_pts = pts[valid]
+            seg_idx = base_indices[valid]
+            seg_colors = cmap(norm(seg_idx))
+            seg_colors[:, 3] = alpha
+            segments = np.stack([seg_pts[:-1], seg_pts[1:]], axis=1)
+            # `linestyles` accepts a single string applied to all segments
+            # in matplotlib 3.6 (verified against the LineCollection
+            # docstring: "linestyles : linestyle or list of linestyles").
+            lc = LineCollection(
+                segments,
+                colors=seg_colors[:-1],
+                linewidths=2,
+                linestyles=linestyle,
+            )
+            ax.add_collection(lc)
+
+    # ---- past (solid, full alpha) ----
+    if past_end > 0:
+        idx = np.arange(past_end)
+        _draw_arm_segments(all_px[:past_end], idx, linestyle='-', alpha=1.0)
+
+    # ---- future (dashed, faded) ----
+    if future_end > future_start:
+        idx = np.arange(future_start, future_end)
+        _draw_arm_segments(
+            all_px[future_start:future_end], idx, linestyle='--', alpha=0.35)
+
+    # ---- current position markers ----
+    if 0 <= current_step < n_total:
+        for arm_idx, marker in enumerate(['o', 's']):
+            pt = all_px[current_step, arm_idx]
+            if pt[0] >= 0 and pt[1] >= 0:
+                ax.plot(
+                    pt[0], pt[1], marker,
+                    color=cmap(norm(current_step)),
+                    markersize=10,
+                    markeredgecolor='white',
+                    markeredgewidth=1.5,
+                )
+
+    ax.set_title(
+        f'{camera_name}\n{overlay_method} traj @ step {current_step}/{n_total}',
+        fontsize=10,
+    )
+
+    # ---- rasterize figure to uint8 (H, W, 3) ----
+    fig.canvas.draw()
+    # buffer_rgba() is the non-deprecated path on mpl 3.6+; returns a
+    # memoryview of the renderer's RGBA buffer.
+    rgba = np.asarray(fig.canvas.buffer_rgba())
+    out = rgba[:, :, :3].copy()  # drop alpha; copy to make C-contiguous
+    plt.close(fig)
+    return out
+
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
 def main(cfg: DictConfig):
     print("=" * 60)
