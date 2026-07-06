@@ -416,6 +416,120 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
     }
 
 
+def _get_camera_params(env, camera_name: str) -> Dict:
+    """
+    Extract camera position (3,), orientation (3, 3), fovy (scalar) from the
+    MuJoCo sim underlying the wrapper stack.
+
+    Wrapper chain (verified against _build_env + robomimic_image_wrapper.py:87):
+        MultiStepWrapper → VideoRecordingWrapper → RobomimicImageWrapper
+        → EnvRobosuite (robomimic) → robosuite env → MuJoCo sim
+    RobomimicImageWrapper.get_flattened_state uses `self.env.env.sim`, where
+    self.env is EnvRobosuite and EnvRobosuite.env is the robosuite env. So
+    from the outermost MultiStepWrapper, sim lives at env.env.env.env.env.sim.
+
+    Tries multiple APIs because robosuite / mujoco versions differ:
+      (1) sim.model.camera_name2id + sim.model.cam_fovy + sim.data.cam_xpos/xmat
+          (standard MuJoCo sim API).
+      (2) sim._render_context.offscreen.cameras[cam_name] (mujoco viewer API;
+          sometimes the only populated source in headless EGL contexts).
+
+    Camera-name convention: robosuite camera names typically lack the
+    `_image` suffix that the obs key carries (e.g. obs key
+    'shouldercamera0_image' → MuJoCo camera 'shouldercamera0'), so we strip
+    it.
+    """
+    # Walk down .env until we find an object exposing .sim (robosuite env) or
+    # .env.env.sim (EnvRobosuite -> robosuite env). Defensive against callers
+    # passing any layer of the wrapper stack.
+    node = env
+    sim = None
+    for _ in range(8):
+        if hasattr(node, 'sim') and node.sim is not None:
+            sim = node.sim
+            break
+        if not hasattr(node, 'env'):
+            break
+        node = node.env
+    if sim is None:
+        raise RuntimeError(
+            f"Could not locate MuJoCo `sim` on the env wrapper stack for "
+            f"camera '{camera_name}'.")
+
+    cam_name = camera_name.replace('_image', '')
+
+    # ---- API (1): standard MuJoCo sim model/data arrays ----
+    try:
+        cam_id = sim.model.camera_name2id(cam_name)
+        cam_pos = sim.data.cam_xpos[cam_id].copy()
+        cam_mat = sim.data.cam_xmat[cam_id].copy().reshape(3, 3)
+        fovy = float(sim.model.cam_fovy[cam_id])
+        return {'pos': cam_pos, 'mat': cam_mat, 'fovy': fovy}
+    except (AttributeError, KeyError, IndexError) as e:
+        print(f"[proj] sim.model camera API failed for '{cam_name}': {e}; "
+              f"trying offscreen viewers...")
+
+    # ---- API (2): mujoco offscreen render context cameras ----
+    try:
+        viewer = sim._render_context.offscreen
+        cam = viewer.cameras[cam_name]
+        cam_pos = np.array(cam.pos)
+        cam_mat = np.array(cam.mat).reshape(3, 3)
+        fovy = float(cam.fovy)
+        return {'pos': cam_pos, 'mat': cam_mat, 'fovy': fovy}
+    except (AttributeError, KeyError, TypeError) as e:
+        raise RuntimeError(
+            f"Could not get camera params for '{cam_name}'. "
+            f"Tried sim.model.camera_name2id and sim._render_context.offscreen.cameras. "
+            f"Original error: {e}")
+
+
+def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
+                       img_size: int = 140) -> np.ndarray:
+    """
+    Project 3D world-coords (N, 3) to 2D pixel coords (N, 2) for `camera_name`.
+
+    Uses pinhole perspective; assumes a square image (img_size x img_size).
+    For Transport the rendered obs images are 140x140 uint8 (verified in
+    scripts/verify_rollout_data.py:129-136 and CLAUDE.md §7), so img_size=140
+    is the correct default.
+
+    Convention notes:
+      - MuJoCo `cam_xmat` is the camera-to-world rotation stored as a
+        row-major flat 9-array; reshape(3,3) yields the cam→world matrix and
+        mat.T is world→cam.
+      - MuJoCo `cam_fovy` is the vertical field-of-view in degrees.
+      - Pixel coordinates follow image convention: +x right, +y down, origin
+        top-left. Camera frame is OpenGL-style (-y forward, +z up) so we
+        negate the y term when dividing by z.
+    """
+    pts = np.asarray(points_world, dtype=np.float64)
+    if pts.ndim != 2 or pts.shape[1] != 3:
+        raise ValueError(
+            f"points_world must have shape (N, 3); got {pts.shape}.")
+
+    params = _get_camera_params(env, camera_name)
+    pos = np.asarray(params['pos'], dtype=np.float64).reshape(3)
+    mat = np.asarray(params['mat'], dtype=np.float64).reshape(3, 3)
+    fovy = float(params['fovy'])
+
+    # World → camera frame (mat is cam→world, so mat.T is world→cam).
+    p_rel = pts - pos[None, :]
+    p_cam = p_rel @ mat.T  # (N, 3)
+
+    # Vertical focal length from fovy (degrees). Square image so f_x = f_y.
+    f = (img_size / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
+
+    z = p_cam[:, 2]
+    valid = z > 1e-6
+    px = np.full_like(z, -1.0)
+    py = np.full_like(z, -1.0)
+    px[valid] = f * p_cam[valid, 0] / z[valid] + img_size / 2.0
+    py[valid] = -f * p_cam[valid, 1] / z[valid] + img_size / 2.0
+
+    return np.stack([px, py], axis=1)
+
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
 def main(cfg: DictConfig):
     print("=" * 60)
