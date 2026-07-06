@@ -803,9 +803,83 @@ def main(cfg: DictConfig):
     print("=" * 60)
     print("LPB vs Base Policy Comparison")
     print("=" * 60)
-    # TODO: wire everything together in Task 9
-    print("Config loaded:")
     print(OmegaConf.to_yaml(cfg))
+
+    pathlib.Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
+    # Save config
+    OmegaConf.save(cfg, os.path.join(cfg.output_dir, 'compare_config.yaml'))
+
+    # ---- Phase 1: base rollout ----
+    print("\n[Phase 1] Loading base policy + running base rollout...")
+    base_policy, cfg_task = _load_base_policy(cfg)
+    env, _ = _build_env(cfg_task, cfg, seed=cfg.compare_seed)
+    base_result = _run_rollout(base_policy, env, cfg, use_guidance=False, label='base')
+    del base_policy
+    torch.cuda.empty_cache()
+
+    # ---- Phase 2: LPB rollout ----
+    print("\n[Phase 2] Loading LPB policy + running LPB rollout...")
+    lpb_policy, _ = _load_lpb_policy(cfg)
+    env2, _ = _build_env(cfg_task, cfg, seed=cfg.compare_seed)
+    lpb_result = _run_rollout(lpb_policy, env2, cfg, use_guidance=True, label='lpb')
+    del lpb_policy
+    torch.cuda.empty_cache()
+
+    # ---- Phase 3: sanity check projection ----
+    print("\n[Phase 3] Projection sanity check...")
+    cam = cfg.render_views[0]
+    eef0 = base_result['eef_traj'][0, 0]
+    px = _project_to_camera(eef0.reshape(1, 3), env, cam)[0]
+    assert 0 <= px[0] < 140 and 0 <= px[1] < 140, \
+        f"Projection sanity check failed: {px}"
+    print(f"  OK: world {eef0} -> px {px}")
+
+    # ---- Phase 4: save rollout data ----
+    print("\n[Phase 4] Saving rollout data...")
+    np.savez_compressed(
+        os.path.join(cfg.output_dir, 'rollout_data.npz'),
+        base_eef=base_result['eef_traj'],
+        base_actions=base_result['actions'],
+        base_success=base_result['success'],
+        base_success_step=base_result['success_step'],
+        lpb_eef=lpb_result['eef_traj'],
+        lpb_actions=lpb_result['actions'],
+        lpb_success=lpb_result['success'],
+        lpb_success_step=lpb_result['success_step'],
+    )
+
+    # ---- Phase 5: render videos ----
+    print("\n[Phase 5a] Video 1: base driving, LPB overlay...")
+    _make_video(
+        driver_result=base_result,
+        overlay_result=lpb_result,
+        overlay_method='lpb',
+        env=env,
+        view_names=list(cfg.render_views),
+        cfg=cfg,
+        output_path=os.path.join(cfg.output_dir, 'base_driving_lpb_overlay.mp4'),
+    )
+
+    print("\n[Phase 5b] Video 2: LPB driving, base overlay...")
+    _make_video(
+        driver_result=lpb_result,
+        overlay_result=base_result,
+        overlay_method='base',
+        env=env2,
+        view_names=list(cfg.render_views),
+        cfg=cfg,
+        output_path=os.path.join(cfg.output_dir, 'lpb_driving_base_overlay.mp4'),
+    )
+
+    print("\n" + "=" * 60)
+    print("DONE")
+    print(f"  Output dir: {cfg.output_dir}")
+    print(f"  - base_driving_lpb_overlay.mp4 ({base_result['n_samples']} frames)")
+    print(f"  - lpb_driving_base_overlay.mp4 ({lpb_result['n_samples']} frames)")
+    print(f"  - rollout_data.npz")
+    print(f"  Base success: {base_result['success']} @ step {base_result['success_step']}")
+    print(f"  LPB  success: {lpb_result['success']} @ step {lpb_result['success_step']}")
+    print("=" * 60)
 
 
 if __name__ == '__main__':
