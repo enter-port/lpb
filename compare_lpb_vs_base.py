@@ -234,6 +234,188 @@ def _build_env(cfg_task, cfg: DictConfig, seed: int,
     return env, obs
 
 
+def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
+    """
+    Run a full rollout with `policy` on `env` and sample eef poses / frames
+    every `cfg.eef_sample_interval` env chunks.
+
+    `env` MUST already be built. We re-seed with cfg.compare_seed here so the
+    same env instance can be reused for both rollouts (the seed_state_map
+    cache in RobomimicImageWrapper makes the second reset cheap).
+
+    The env is a MultiStepWrapper, so one env.step() call consumes
+    `n_action_steps` underlying robosuite steps with one action chunk
+    `(n_action_steps, action_dim)`; we treat that as one "chunk" / decision
+    step. cfg.max_steps caps the number of chunks.
+
+    Returns a dict with keys:
+        eef_traj      (T_sample, 2, 3) float  - sampled robot0/robot1 eef xyz
+        frames        {view: (T_sample, H, W, 3) uint8}
+        actions       (T_sample, action_dim_env) float - env-space action chunks
+        success       bool
+        success_step  int  (-1 if never succeeded)
+        n_steps       int  - total env.step() chunks executed
+        n_samples     int  - == eef_traj.shape[0]
+
+    Verified against the actual policy/env API:
+      - predict_action[_dyn_guided] expects obs_dict {key: (B, To, ...)} torch tensors
+        (see diffusion_unet_hybrid_image_policy.py:273-353 and :355-436).
+      - The returned 'action' is shape (B, n_action_steps, action_dim) and is
+        ALREADY unnormalized (lines 342 and 425 call normalizer['action'].unnormalize).
+        So we do NOT re-unnormalize in this function.
+      - MultiStepWrapper.step(action) expects action of shape
+        (n_action_steps, action_dim) and iterates internally
+        (see gym_util/multistep_wrapper.py:101-124).
+      - For abs_action envs (Transport: control_delta=False), the policy outputs
+        rotation_6d (20-dim dual-arm) but the underlying robosuite controller
+        wants axis_angle (14-dim). Both runners call undo_transform_action()
+        before env.step(); we mirror that here.
+      - get_success_label() lives on RobomimicImageWrapper (innermost env).
+        Wrapper stack: MultiStepWrapper -> VideoRecordingWrapper -> RobomimicImageWrapper,
+        so we access it via env.env.env.get_success_label()
+        (matches robomimic_image_sequential_runner.py:243).
+      - obs from env.reset()/env.step() is a dict with values shaped
+        (n_obs_steps, ...) (MultiStepWrapper stacks them); we index [-1] for the
+        latest observation when sampling eef/frames.
+      - RobomimicImageWrapper.get_observation() copies raw robomimic obs through
+        unchanged (env/robomimic/robomimic_image_wrapper.py:71-80), so image
+        keys arrive as uint8 (H, W, 3) arrays.
+    """
+    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
+
+    # ---- abs_action / rotation transformer (mirrors both runners) ----
+    # Transport uses abs_action=True; rotation_6d<->axis_angle conversion is
+    # required before env.step. If this script is ever extended to other tasks,
+    # make `abs_action` a cfg field instead of hard-coding True.
+    abs_action = True
+    rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d') if abs_action else None
+
+    def undo_transform_action(action: np.ndarray) -> np.ndarray:
+        """rotation_6d (...,20) -> axis_angle (...,14). Mirrors both runners."""
+        raw_shape = action.shape
+        if raw_shape[-1] == 20:
+            # dual arm
+            action = action.reshape(*raw_shape[:-1], 2, 10)
+        d_rot = action.shape[-1] - 4
+        pos = action[..., :3]
+        rot = action[..., 3:3 + d_rot]
+        gripper = action[..., [-1]]
+        rot = rotation_transformer.inverse(rot)
+        uaction = np.concatenate([pos, rot, gripper], axis=-1)
+        if raw_shape[-1] == 20:
+            # dual arm
+            uaction = uaction.reshape(*raw_shape[:-1], 14)
+        return uaction
+
+    # ---- seed + reset (deterministic re-roll) ----
+    env.seed(cfg.compare_seed)
+    obs = env.reset()
+    policy.reset()
+
+    eef_list: List[np.ndarray] = []
+    frame_dict: Dict[str, List[np.ndarray]] = {v: [] for v in cfg.render_views}
+    actions_list: List[np.ndarray] = []
+
+    success = False
+    success_step = -1
+    n_chunks = 0  # number of env.step() calls (each consumes n_action_steps)
+
+    print(f"[rollout:{label}] starting. use_guidance={use_guidance}, "
+          f"max_chunks={cfg.max_steps}, sample_interval={cfg.eef_sample_interval}")
+
+    for chunk_idx in range(cfg.max_steps):
+        # ---- build obs dict (B=1, To, ...) ----
+        # Each obs value is (n_obs_steps, ...); add batch dim -> (1, n_obs_steps, ...).
+        np_obs_dict = {k: np.expand_dims(v, axis=0) for k, v in obs.items()}
+        obs_dict = {k: torch.from_numpy(v).to(policy.device) for k, v in np_obs_dict.items()}
+
+        # ---- policy forward ----
+        # predict_action_dyn_guided uses grad internally (for classifier guidance),
+        # so we do NOT wrap it in torch.no_grad(). predict_action is pure DDPM
+        # sampling and benefits from no_grad.
+        if use_guidance:
+            action_dict = policy.predict_action_dyn_guided(obs_dict)
+        else:
+            with torch.no_grad():
+                action_dict = policy.predict_action(obs_dict)
+
+        # action shape: (1, n_action_steps, action_dim_policy); squeeze batch.
+        action = action_dict['action'][0].detach().to('cpu').numpy()
+        if not np.all(np.isfinite(action)):
+            raise RuntimeError(
+                f"[rollout:{label}] NaN/Inf in policy action at chunk {chunk_idx}")
+
+        # ---- env step ----
+        # MultiStepWrapper.step expects (n_action_steps, action_dim).
+        # For abs_action envs the policy outputs rotation_6d (20-dim dual-arm);
+        # convert to axis_angle (14-dim) before stepping.
+        env_action = undo_transform_action(action) if abs_action else action
+
+        obs, reward, done, info = env.step(env_action)
+        n_chunks += 1
+
+        # ---- sample eef + frames at the configured cadence ----
+        if chunk_idx % cfg.eef_sample_interval == 0:
+            # obs[*] is stacked (n_obs_steps, ...); index [-1] for the latest.
+            eef = np.stack([
+                obs['robot0_eef_pos'][-1].copy(),
+                obs['robot1_eef_pos'][-1].copy(),
+            ])  # (2, 3)
+            eef_list.append(eef)
+
+            for v in cfg.render_views:
+                img = obs[v][-1]  # (H, W, 3)
+                # RobomimicImageWrapper passes through robomimic's uint8
+                # (H,W,3) arrays unchanged. Defensively coerce dtype.
+                if img.dtype != np.uint8:
+                    img = np.clip(img, 0, 255).astype(np.uint8)
+                frame_dict[v].append(img.copy())
+
+            actions_list.append(env_action.copy())
+
+        # ---- success / termination ----
+        try:
+            cur_success = bool(env.env.env.get_success_label())
+        except (AttributeError, RuntimeError) as e:
+            print(f"[rollout:{label}] WARN: could not read success label ({e}); treating as False")
+            cur_success = False
+
+        if cur_success and not success:
+            success = True
+            success_step = chunk_idx
+            print(f"[rollout:{label}] SUCCESS at chunk {chunk_idx}")
+            break
+
+        if bool(np.all(done)):
+            print(f"[rollout:{label}] env returned done=True at chunk {chunk_idx} (truncated/terminated)")
+            break
+
+    # ---- pack outputs ----
+    eef_traj = np.stack(eef_list) if eef_list else np.zeros((0, 2, 3), dtype=np.float32)
+    frames = {
+        v: (np.stack(frame_dict[v]) if frame_dict[v]
+            else np.zeros((0, 140, 140, 3), dtype=np.uint8))
+        for v in cfg.render_views
+    }
+    if actions_list:
+        actions = np.stack(actions_list)
+    else:
+        # Fall back to env action dim (axis_angle 14 for Transport after undo_transform).
+        actions = np.zeros((0, 14), dtype=np.float32)
+
+    print(f"[rollout:{label}] done. n_chunks={n_chunks}, sampled_points={len(eef_list)}, "
+          f"success={success}, success_step={success_step}")
+    return {
+        'eef_traj': eef_traj,
+        'frames': frames,
+        'actions': actions,
+        'success': success,
+        'success_step': success_step,
+        'n_steps': n_chunks,
+        'n_samples': len(eef_list),
+    }
+
+
 @hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
 def main(cfg: DictConfig):
     print("=" * 60)
