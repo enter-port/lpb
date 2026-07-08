@@ -500,8 +500,13 @@ def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
         mat.T is world→cam.
       - MuJoCo `cam_fovy` is the vertical field-of-view in degrees.
       - Pixel coordinates follow image convention: +x right, +y down, origin
-        top-left. Camera frame is OpenGL-style (-y forward, +z up) so we
-        negate the y term when dividing by z.
+        top-left. MuJoCo cameras use the OpenGL convention (camera looks
+        along -Z, +Y up, +X right), so visible points have z_cam < 0 and
+        we project with `depth = -z_cam` (positive).
+      - Transform application note: for NumPy `(N,3) @ (3,3)` the matrix
+        is applied to each row *as a column vector via the matrix's
+        transpose*. So to apply world→cam (`mat.T` in column-vector form)
+        to row vectors `p_rel`, we right-multiply by `mat` (NOT `mat.T`).
     """
     pts = np.asarray(points_world, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
@@ -513,54 +518,27 @@ def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
     mat = np.asarray(params['mat'], dtype=np.float64).reshape(3, 3)
     fovy = float(params['fovy'])
 
-    # World → camera frame (mat is cam→world, so mat.T is world→cam).
+    # World → camera frame.
+    # `mat` is MuJoCo's cam→world rotation (columns are cam axes in world).
+    # For NumPy row vectors (N,3)@(3,3), right-multiplying by `mat` applies
+    # `mat.T` (= world→cam) to each row as a column vector — which is what
+    # we want. (`p_rel @ mat.T` would apply `mat` to world-frame vectors,
+    # which is geometrically meaningless and yields out-of-frame pixels.)
     p_rel = pts - pos[None, :]
-    p_cam = p_rel @ mat.T  # (N, 3)
-
-    # =====================================================================
-    # [DIAGNOSTIC] Projection sanity — print camera params and the first
-    # input point's p_cam under BOTH transpose conventions, so we can
-    # decide whether the fix should be `p_rel @ mat` (no transpose) and
-    # whether MuJoCo uses OpenGL (-Z forward, visible points have z<0) or
-    # +Z forward. Prints only once per process; remove after the fix lands.
-    # =====================================================================
-    if not getattr(_project_to_camera, '_diag_printed', False):
-        _project_to_camera._diag_printed = True
-        print("=" * 70)
-        print(f"[diag] camera_name={camera_name}, img_size={img_size}")
-        print(f"[diag] cam_pos (world)  = {pos}")
-        print(f"[diag] cam_fovy (deg)   = {fovy}")
-        print(f"[diag] cam_mat (cam→world; columns = cam axes in world) =\n{mat}")
-        print(f"[diag] mat[:,0] cam_X in world (should be 'right')  = {mat[:, 0]}")
-        print(f"[diag] mat[:,1] cam_Y in world (should be 'up')     = {mat[:, 1]}")
-        print(f"[diag] mat[:,2] cam_Z in world (should be 'back',   = {mat[:, 2]}")
-        print(f"[diag]         opposite the viewing direction)")
-        # Compare both transpose conventions on the first input point.
-        p0_world = pts[0]
-        p0_rel   = p0_world - pos
-        p_cam_bug = p0_rel @ mat.T    # current code
-        p_cam_fix = p0_rel @ mat      # candidate fix
-        f_diag = (img_size / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
-        print(f"[diag] focal length f = {f_diag:.4f} px")
-        print(f"[diag] point[0] world  = {p0_world}")
-        print(f"[diag] point[0] p_rel  = {p0_rel}")
-        print(f"[diag] p_cam[0] BUGGY (p_rel @ mat.T) = {p_cam_bug}  "
-              f"z={p_cam_bug[2]:+.4f}")
-        print(f"[diag] p_cam[0] FIXED (p_rel @ mat)   = {p_cam_fix}  "
-              f"z={p_cam_fix[2]:+.4f}")
-        print(f"[diag] MuJoCo OpenGL (-Z forward): FIXED z should be "
-              f"NEGATIVE if the point is actually visible.")
-        print("=" * 70)
+    p_cam = p_rel @ mat  # (N, 3)
 
     # Vertical focal length from fovy (degrees). Square image so f_x = f_y.
     f = (img_size / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
 
+    # MuJoCo cameras look along -Z (OpenGL), so visible points have
+    # z_cam < 0. Use depth = -z_cam (positive) for the perspective divide.
     z = p_cam[:, 2]
-    valid = z > 1e-6
+    depth = -z
+    valid = depth > 1e-6
     px = np.full_like(z, -1.0)
     py = np.full_like(z, -1.0)
-    px[valid] = f * p_cam[valid, 0] / z[valid] + img_size / 2.0
-    py[valid] = -f * p_cam[valid, 1] / z[valid] + img_size / 2.0
+    px[valid] =  f * p_cam[valid, 0] / depth[valid] + img_size / 2.0
+    py[valid] = -f * p_cam[valid, 1] / depth[valid] + img_size / 2.0
 
     return np.stack([px, py], axis=1)
 
