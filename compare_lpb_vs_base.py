@@ -364,9 +364,16 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
             eef_list.append(eef)
 
             for v in cfg.render_views:
-                img = obs[v][-1]  # (H, W, 3)
-                # RobomimicImageWrapper passes through robomimic's uint8
-                # (H,W,3) arrays unchanged. Defensively coerce dtype.
+                img = obs[v][-1]
+                # In this code path image observations arrive channels-first
+                # as (3, 140, 140) — `_make_video` infers img_size from
+                # `frames[view].shape[1]`, so we MUST normalize to
+                # channels-last (H, W, 3) here, otherwise img_size collapses
+                # to 3 and `imshow` rejects the (3, 140, 140) frame.
+                # Detect channels-first by "first dim is 3 and the other
+                # two spatial dims are equal" (works for any square image).
+                if img.ndim == 3 and img.shape[0] == 3 and img.shape[1] == img.shape[2]:
+                    img = np.transpose(img, (1, 2, 0))
                 if img.dtype != np.uint8:
                     img = np.clip(img, 0, 255).astype(np.uint8)
                 frame_dict[v].append(img.copy())
