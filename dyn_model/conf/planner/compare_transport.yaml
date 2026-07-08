@@ -18,10 +18,6 @@ planner_target: 'dyn_model.planner.Planner'
 # ---- Script-specific ----
 compare_seed: 100000              # initial state seed (matches eval test_start_seed format)
 max_steps: 700                    # rollout cap (matches task.env_runner.max_steps)
-eef_sample_interval: 5            # sample eef + frame every N steps (~140 points over 700 steps)
-render_views:
-  - shouldercamera0_image
-  - shouldercamera1_image
 video_fps: 20
 video_frame_scale: 2              # upscale each camera image (140 -> 280)
 output_dir: 'data/compare_lpb_vs_base'

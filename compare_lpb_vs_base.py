@@ -1,8 +1,21 @@
 """
-Compare LPB vs Base Policy — generate two visualization videos.
+Compare LPB vs Base Policy — generate ONE visualization video.
 
-Video 1: base policy drives the env, LPB's eef trajectory overlaid.
-Video 2: LPB drives the env, base policy's eef trajectory overlaid.
+The video shows LPB (base + dynamics model + classifier guidance) driving the
+env from a seed-initialized state, recorded at full env fps via the standard
+`VideoRecordingWrapper` (same path as `eval_test_time_optimization.py`). The
+BASE policy's eef trajectory — obtained from a second rollout started from the
+SAME seed but run WITHOUT guidance — is projected onto the video as a colored
+polyline (past = solid, future = dashed).
+
+Pipeline:
+    1. Build env via the standard `create_env` factory.
+    2. LPB rollout:  set file_path -> env records MP4 at full fps; sample eef
+                     every chunk for diagnostics.
+    3. Base rollout: separate env instance, same seed, no video recording,
+                     sample eef every chunk.
+    4. Sanity-check the camera projection.
+    5. Read LPB's MP4 frame-by-frame, overlay base's eef trajectory, write MP4.
 
 See docs/superpowers/specs/2026-07-06-lpb-vs-base-comparison-design.md
 
@@ -14,7 +27,7 @@ import sys
 import os
 import json
 import pathlib
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import hydra
@@ -23,11 +36,16 @@ import torch
 import dill
 
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
+from diffusion_policy.env_runner.robomimic_image_sequential_runner import create_env
 
 # Line-buffered output for real-time progress in nohup logs
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
+
+# ===========================================================================
+# Policy loaders (unchanged from previous version)
+# ===========================================================================
 
 def _load_policy_payload(policy_checkpoint: str):
     """Load the .ckpt payload and return (payload, cfg_task). Shared by base + LPB loaders."""
@@ -81,16 +99,7 @@ def _load_base_policy(cfg: DictConfig):
 
 
 def _load_lpb_policy(cfg: DictConfig):
-    """Load LPB policy (WITH planner / dynamics model). Mirrors eval_test_time_optimization.py.
-
-    NOTE: the actual `initialize_planner` signature is
-        initialize_planner(self, planner_target, demo_dataset_config,
-                           dynamics_model_ckpt, action_step, output_dir,
-                           guidance_start_timestep, guidance_scale,
-                           threshold, demo_dataset_path=None)
-    so the kwargs here are kept in lock-step with that signature and with
-    eval_test_time_optimization.py:73-83.
-    """
+    """Load LPB policy (WITH planner / dynamics model). Mirrors eval_test_time_optimization.py."""
     payload, cfg_task = _load_policy_payload(cfg.policy_checkpoint)
     cfg_task = _apply_common_overrides(cfg_task, cfg)
 
@@ -112,9 +121,9 @@ def _load_lpb_policy(cfg: DictConfig):
     policy.normalizer.load_state_dict(torch.load(normalizer_path))
     policy.normalizer.to(device)
 
-    # Inject planner + dynamics model. demo_dataset_config MUST be the already-
-    # overridden cfg_task.task.dataset (CLAUDE.md §6.1 gotcha #2: planner.py
-    # reads dataset_path off this config object during __init__).
+    # demo_dataset_config MUST be the already-overridden cfg_task.task.dataset
+    # (CLAUDE.md §6.1 gotcha #2: planner.py reads dataset_path off this config
+    # object during __init__).
     policy.initialize_planner(
         planner_target=cfg.planner_target,
         demo_dataset_config=cfg_task.task.dataset,
@@ -130,118 +139,80 @@ def _load_lpb_policy(cfg: DictConfig):
     return policy, cfg_task
 
 
-def _build_env(cfg_task, cfg: DictConfig, seed: int,
-               render_obs_key: str = 'shouldercamera0_image'):
+# ===========================================================================
+# Env construction — thin wrapper around the standard runner's create_env
+# ===========================================================================
+
+def _build_env(cfg_task, cfg: DictConfig) -> Tuple[object, str, int, int]:
+    """Build env via the standard `create_env` factory from
+    `robomimic_image_sequential_runner`.
+
+    Does NOT seed or reset — the caller does that AFTER setting
+    `env.env.file_path` so that VideoRecordingWrapper records.
+
+    Returns (env, render_obs_key, n_action_steps, steps_per_render).
+    Wrapper stack (outside-in): MultiStepWrapper → VideoRecordingWrapper
+    → RobomimicImageWrapper → EnvRobosuite. So `env.env` IS the
+    VideoRecordingWrapper (where `file_path` lives).
     """
-    Build a SINGLE RobomimicImageWrapper-based env, seed it, and reset.
-
-    Mirrors `create_env` + `_initialize_env` from
-    `diffusion_policy/env_runner/robomimic_image_sequential_runner.py`
-    (NOT the parallel `RobomimicImageRunner`, which builds N envs via
-    `AsyncVectorEnv`). We need a single env because the comparison script
-    drives it manually step-by-step and reads eef pose / images at every
-    step.
-
-    Construction layering (outside-in):
-        MultiStepWrapper                      # n_obs_steps / n_action_steps / max_steps
-          > VideoRecordingWrapper             # H.264 recorder (file_path set later per episode)
-              > RobomimicImageWrapper         # gym.Env wrapper around robomimic EnvRobosuite
-                  > EnvRobosuite (robomimic)  # actual robosuite env
-
-    Required cfg_task.task.env_runner fields used:
-        dataset_path, shape_meta, n_obs_steps, n_action_steps, max_steps,
-        render_obs_key, fps, crf, abs_action
-    """
-    import collections
     import robomimic.utils.file_utils as FileUtils
-    import robomimic.utils.env_utils as EnvUtils
-    import robomimic.utils.obs_utils as ObsUtils
-    from diffusion_policy.env.robomimic.robomimic_image_wrapper import RobomimicImageWrapper
-    from diffusion_policy.gym_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
-    from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
-    from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 
     env_runner_cfg = cfg_task.task.env_runner
     dataset_path = os.path.expanduser(env_runner_cfg.dataset_path)
+
+    # Read env_meta and apply abs_action controller tweak (same as sequential
+    # runner __init__: control_delta=False makes the env consume rotation_6d
+    # actions directly).
+    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
+    env_meta['env_kwargs']['use_object_obs'] = False
+    abs_action = getattr(env_runner_cfg, 'abs_action', True)
+    if abs_action:
+        env_meta['env_kwargs']['controller_configs']['control_delta'] = False
+
     shape_meta = OmegaConf.to_container(env_runner_cfg.shape_meta, resolve=True)
+    render_obs_key = env_runner_cfg.render_obs_key
     n_obs_steps = env_runner_cfg.n_obs_steps
     n_action_steps = env_runner_cfg.n_action_steps
     max_steps = getattr(env_runner_cfg, 'max_steps', cfg.get('max_steps', 400))
     fps = getattr(env_runner_cfg, 'fps', 10)
     crf = getattr(env_runner_cfg, 'crf', 22)
-    abs_action = getattr(env_runner_cfg, 'abs_action', True)
 
-    # ---- 1. Read env_meta from dataset and apply abs_action controller tweak ----
-    env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
-    env_meta['env_kwargs']['use_object_obs'] = False
-    if abs_action:
-        # Mirrors sequential runner __init__: switch controller to absolute mode
-        # so the env consumes rotation_6d actions directly.
-        env_meta['env_kwargs']['controller_configs']['control_delta'] = False
-
-    # ---- 2. Initialize obs modality mapping (required by robomimic) ----
-    modality_mapping = collections.defaultdict(list)
-    for key, attr in shape_meta['obs'].items():
-        modality_mapping[attr.get('type', 'low_dim')].append(key)
-    ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
-
-    # ---- 3. Build the robomimic EnvRobosuite ----
-    robomimic_env = EnvUtils.create_env_from_metadata(
+    env = create_env(
         env_meta=env_meta,
-        render=False,
-        render_offscreen=True,
-        use_image_obs=True,
-    )
-    # Robosuite hard reset causes excessive memory consumption; disable
-    # (same as both runners).
-    robomimic_env.env.hard_reset = False
-
-    # ---- 4. Wrap: RobomimicImageWrapper -> VideoRecordingWrapper -> MultiStepWrapper ----
-    robomimic_wrapper = RobomimicImageWrapper(
-        env=robomimic_env,
         shape_meta=shape_meta,
-        init_state=None,                # test mode: seed-driven reset
+        enable_render=True,
         render_obs_key=render_obs_key,
-    )
-    video_recorder = VideoRecorder.create_h264(
         fps=fps,
-        codec='h264',
-        input_pix_fmt='rgb24',
         crf=crf,
-        thread_type='FRAME',
-        thread_count=1,
-    )
-    video_wrapper = VideoRecordingWrapper(
-        env=robomimic_wrapper,
-        video_recoder=video_recorder,
-        file_path=None,                 # set per-episode by caller
-        steps_per_render=max(20 // fps, 1),
-    )
-    env = MultiStepWrapper(
-        env=video_wrapper,
         n_obs_steps=n_obs_steps,
         n_action_steps=n_action_steps,
-        max_episode_steps=max_steps,
+        max_steps=max_steps,
     )
 
-    # ---- 5. Seed + reset ----
-    # MultiStepWrapper forwards .seed() to its wrapped env (gym.Wrapper behavior);
-    # RobomimicImageWrapper.seed() sets np.random.seed + self._seed, and the
-    # next reset() consumes _seed to produce a deterministic initial state.
-    env.seed(seed)
-    obs = env.reset()
-    print(f"[env] Built env, seed={seed}, reset OK. obs keys: {sorted(obs.keys())}")
-    return env, obs
+    # Robosuite hard reset causes excessive memory consumption; disable
+    # (same as sequential runner __init__).
+    # create_env already does env.env.hard_reset=False on the EnvRobosuite,
+    # so this is just informational.
+    steps_per_render = max(20 // fps, 1)
+
+    print(f"[env] Built env via create_env. render_obs_key={render_obs_key}, "
+          f"n_action_steps={n_action_steps}, fps={fps}, steps_per_render={steps_per_render}, "
+          f"max_steps={max_steps}")
+    return env, render_obs_key, n_action_steps, steps_per_render
 
 
-def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
-    """
-    Run a full rollout with `policy` on `env` and sample eef poses / frames
-    every `cfg.eef_sample_interval` env chunks.
+# ===========================================================================
+# Rollout — mirrors SequentialRobomimicImageRunner.run's inner loop
+# ===========================================================================
+
+def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
+                 video_path: Optional[str] = None) -> Dict:
+    """Run a rollout. If `video_path` is set, the env records at full fps to
+    that MP4 via VideoRecordingWrapper (file_path must be assigned BEFORE
+    reset, since reset() stops any prior recorder).
 
     `env` MUST already be built. We re-seed with cfg.compare_seed here so the
-    same env instance can be reused for both rollouts (the seed_state_map
-    cache in RobomimicImageWrapper makes the second reset cheap).
+    same env instance can be reused for both rollouts.
 
     The env is a MultiStepWrapper, so one env.step() call consumes
     `n_action_steps` underlying robosuite steps with one action chunk
@@ -249,52 +220,24 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
     step. cfg.max_steps caps the number of chunks.
 
     Returns a dict with keys:
-        eef_traj      (T_sample, 2, 3) float  - sampled robot0/robot1 eef xyz
-        frames        {view: (T_sample, H, W, 3) uint8}
-        actions       (T_sample, action_dim_env) float - env-space action chunks
+        eef_traj      (T, 2, 3) float  - sampled robot0/robot1 eef xyz per chunk
+        actions       (T, action_dim_env) float - env-space action chunks per chunk
         success       bool
         success_step  int  (-1 if never succeeded)
-        n_steps       int  - total env.step() chunks executed
-        n_samples     int  - == eef_traj.shape[0]
-
-    Verified against the actual policy/env API:
-      - predict_action[_dyn_guided] expects obs_dict {key: (B, To, ...)} torch tensors
-        (see diffusion_unet_hybrid_image_policy.py:273-353 and :355-436).
-      - The returned 'action' is shape (B, n_action_steps, action_dim) and is
-        ALREADY unnormalized (lines 342 and 425 call normalizer['action'].unnormalize).
-        So we do NOT re-unnormalize in this function.
-      - MultiStepWrapper.step(action) expects action of shape
-        (n_action_steps, action_dim) and iterates internally
-        (see gym_util/multistep_wrapper.py:101-124).
-      - For abs_action envs (Transport: control_delta=False), the policy outputs
-        rotation_6d (20-dim dual-arm) but the underlying robosuite controller
-        wants axis_angle (14-dim). Both runners call undo_transform_action()
-        before env.step(); we mirror that here.
-      - get_success_label() lives on RobomimicImageWrapper (innermost env).
-        Wrapper stack: MultiStepWrapper -> VideoRecordingWrapper -> RobomimicImageWrapper,
-        so we access it via env.env.env.get_success_label()
-        (matches robomimic_image_sequential_runner.py:243).
-      - obs from env.reset()/env.step() is a dict with values shaped
-        (n_obs_steps, ...) (MultiStepWrapper stacks them); we index [-1] for the
-        latest observation when sampling eef/frames.
-      - RobomimicImageWrapper.get_observation() copies raw robomimic obs through
-        unchanged (env/robomimic/robomimic_image_wrapper.py:71-80), so image
-        keys arrive as uint8 (H, W, 3) arrays.
+        n_steps       int  - total env.step() chunks executed (== T unless break)
+        n_samples     int  - == eef_traj.shape[0] == T
+        video_path    Optional[str] - the recorded MP4 path (None if not recording)
     """
     from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 
-    # ---- abs_action / rotation transformer (mirrors both runners) ----
-    # Transport uses abs_action=True; rotation_6d<->axis_angle conversion is
-    # required before env.step. If this script is ever extended to other tasks,
-    # make `abs_action` a cfg field instead of hard-coding True.
+    # ---- abs_action / rotation transformer (mirrors sequential runner) ----
     abs_action = True
     rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d') if abs_action else None
 
     def undo_transform_action(action: np.ndarray) -> np.ndarray:
-        """rotation_6d (...,20) -> axis_angle (...,14). Mirrors both runners."""
+        """rotation_6d (...,20) -> axis_angle (...,14). Mirrors sequential runner."""
         raw_shape = action.shape
         if raw_shape[-1] == 20:
-            # dual arm
             action = action.reshape(*raw_shape[:-1], 2, 10)
         d_rot = action.shape[-1] - 4
         pos = action[..., :3]
@@ -303,9 +246,15 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
         rot = rotation_transformer.inverse(rot)
         uaction = np.concatenate([pos, rot, gripper], axis=-1)
         if raw_shape[-1] == 20:
-            # dual arm
             uaction = uaction.reshape(*raw_shape[:-1], 14)
         return uaction
+
+    # ---- set video file_path BEFORE reset ----
+    # env.env is VideoRecordingWrapper (MultiStepWrapper.env).
+    # If file_path is None, no frames are recorded.
+    env.env.file_path = video_path
+    if video_path is not None:
+        print(f"[rollout:{label}] env will record to {video_path}")
 
     # ---- seed + reset (deterministic re-roll) ----
     env.seed(cfg.compare_seed)
@@ -313,26 +262,23 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
     policy.reset()
 
     eef_list: List[np.ndarray] = []
-    frame_dict: Dict[str, List[np.ndarray]] = {v: [] for v in cfg.render_views}
     actions_list: List[np.ndarray] = []
-
     success = False
     success_step = -1
-    n_chunks = 0  # number of env.step() calls (each consumes n_action_steps)
+    n_chunks = 0
 
     print(f"[rollout:{label}] starting. use_guidance={use_guidance}, "
-          f"max_chunks={cfg.max_steps}, sample_interval={cfg.eef_sample_interval}")
+          f"max_chunks={cfg.max_steps}")
 
     for chunk_idx in range(cfg.max_steps):
         # ---- build obs dict (B=1, To, ...) ----
-        # Each obs value is (n_obs_steps, ...); add batch dim -> (1, n_obs_steps, ...).
         np_obs_dict = {k: np.expand_dims(v, axis=0) for k, v in obs.items()}
         obs_dict = {k: torch.from_numpy(v).to(policy.device) for k, v in np_obs_dict.items()}
 
         # ---- policy forward ----
-        # predict_action_dyn_guided uses grad internally (for classifier guidance),
-        # so we do NOT wrap it in torch.no_grad(). predict_action is pure DDPM
-        # sampling and benefits from no_grad.
+        # predict_action_dyn_guided uses grad internally (for classifier
+        # guidance), so we do NOT wrap it in torch.no_grad(). predict_action
+        # is pure DDPM sampling and benefits from no_grad.
         if use_guidance:
             action_dict = policy.predict_action_dyn_guided(obs_dict)
         else:
@@ -346,39 +292,17 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
                 f"[rollout:{label}] NaN/Inf in policy action at chunk {chunk_idx}")
 
         # ---- env step ----
-        # MultiStepWrapper.step expects (n_action_steps, action_dim).
-        # For abs_action envs the policy outputs rotation_6d (20-dim dual-arm);
-        # convert to axis_angle (14-dim) before stepping.
         env_action = undo_transform_action(action) if abs_action else action
-
         obs, reward, done, info = env.step(env_action)
         n_chunks += 1
 
-        # ---- sample eef + frames at the configured cadence ----
-        if chunk_idx % cfg.eef_sample_interval == 0:
-            # obs[*] is stacked (n_obs_steps, ...); index [-1] for the latest.
-            eef = np.stack([
-                obs['robot0_eef_pos'][-1].copy(),
-                obs['robot1_eef_pos'][-1].copy(),
-            ])  # (2, 3)
-            eef_list.append(eef)
-
-            for v in cfg.render_views:
-                img = obs[v][-1]
-                # In this code path image observations arrive channels-first
-                # as (3, 140, 140) — `_make_video` infers img_size from
-                # `frames[view].shape[1]`, so we MUST normalize to
-                # channels-last (H, W, 3) here, otherwise img_size collapses
-                # to 3 and `imshow` rejects the (3, 140, 140) frame.
-                # Detect channels-first by "first dim is 3 and the other
-                # two spatial dims are equal" (works for any square image).
-                if img.ndim == 3 and img.shape[0] == 3 and img.shape[1] == img.shape[2]:
-                    img = np.transpose(img, (1, 2, 0))
-                if img.dtype != np.uint8:
-                    img = np.clip(img, 0, 255).astype(np.uint8)
-                frame_dict[v].append(img.copy())
-
-            actions_list.append(env_action.copy())
+        # ---- sample eef + action EVERY chunk (smoothest overlay trajectory) ----
+        eef = np.stack([
+            obs['robot0_eef_pos'][-1].copy(),
+            obs['robot1_eef_pos'][-1].copy(),
+        ])  # (2, 3)
+        eef_list.append(eef)
+        actions_list.append(env_action.copy())
 
         # ---- success / termination ----
         try:
@@ -397,58 +321,35 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str) -> Dict:
             print(f"[rollout:{label}] env returned done=True at chunk {chunk_idx} (truncated/terminated)")
             break
 
+    # ---- finalize video ----
+    # env.render() on MultiStepWrapper delegates down to VideoRecordingWrapper.render,
+    # which stops the recorder (flushing the MP4) and returns the file_path.
+    final_video_path = env.render() if video_path is not None else None
+
     # ---- pack outputs ----
     eef_traj = np.stack(eef_list) if eef_list else np.zeros((0, 2, 3), dtype=np.float32)
-    frames = {
-        v: (np.stack(frame_dict[v]) if frame_dict[v]
-            else np.zeros((0, 140, 140, 3), dtype=np.uint8))
-        for v in cfg.render_views
-    }
-    if actions_list:
-        actions = np.stack(actions_list)
-    else:
-        # Fall back to env action dim (axis_angle 14 for Transport after undo_transform).
-        actions = np.zeros((0, 14), dtype=np.float32)
+    actions = np.stack(actions_list) if actions_list else np.zeros((0, 14), dtype=np.float32)
 
     print(f"[rollout:{label}] done. n_chunks={n_chunks}, sampled_points={len(eef_list)}, "
           f"success={success}, success_step={success_step}")
     return {
         'eef_traj': eef_traj,
-        'frames': frames,
         'actions': actions,
         'success': success,
         'success_step': success_step,
         'n_steps': n_chunks,
         'n_samples': len(eef_list),
+        'video_path': final_video_path,
     }
 
 
+# ===========================================================================
+# Camera projection (3D world → 2D pixel)
+# ===========================================================================
+
 def _get_camera_params(env, camera_name: str) -> Dict:
-    """
-    Extract camera position (3,), orientation (3, 3), fovy (scalar) from the
-    MuJoCo sim underlying the wrapper stack.
-
-    Wrapper chain (verified against _build_env + robomimic_image_wrapper.py:87):
-        MultiStepWrapper → VideoRecordingWrapper → RobomimicImageWrapper
-        → EnvRobosuite (robomimic) → robosuite env → MuJoCo sim
-    RobomimicImageWrapper.get_flattened_state uses `self.env.env.sim`, where
-    self.env is EnvRobosuite and EnvRobosuite.env is the robosuite env. So
-    from the outermost MultiStepWrapper, sim lives at env.env.env.env.env.sim.
-
-    Tries multiple APIs because robosuite / mujoco versions differ:
-      (1) sim.model.camera_name2id + sim.model.cam_fovy + sim.data.cam_xpos/xmat
-          (standard MuJoCo sim API).
-      (2) sim._render_context.offscreen.cameras[cam_name] (mujoco viewer API;
-          sometimes the only populated source in headless EGL contexts).
-
-    Camera-name convention: robosuite camera names typically lack the
-    `_image` suffix that the obs key carries (e.g. obs key
-    'shouldercamera0_image' → MuJoCo camera 'shouldercamera0'), so we strip
-    it.
-    """
-    # Walk down .env until we find an object exposing .sim (robosuite env) or
-    # .env.env.sim (EnvRobosuite -> robosuite env). Defensive against callers
-    # passing any layer of the wrapper stack.
+    """Extract camera position (3,), orientation (3, 3), fovy (scalar) from the
+    MuJoCo sim underlying the wrapper stack."""
     node = env
     sim = None
     for _ in range(8):
@@ -465,7 +366,6 @@ def _get_camera_params(env, camera_name: str) -> Dict:
 
     cam_name = camera_name.replace('_image', '')
 
-    # ---- API (1): standard MuJoCo sim model/data arrays ----
     try:
         cam_id = sim.model.camera_name2id(cam_name)
         cam_pos = sim.data.cam_xpos[cam_id].copy()
@@ -476,7 +376,6 @@ def _get_camera_params(env, camera_name: str) -> Dict:
         print(f"[proj] sim.model camera API failed for '{cam_name}': {e}; "
               f"trying offscreen viewers...")
 
-    # ---- API (2): mujoco offscreen render context cameras ----
     try:
         viewer = sim._render_context.offscreen
         cam = viewer.cameras[cam_name]
@@ -493,52 +392,29 @@ def _get_camera_params(env, camera_name: str) -> Dict:
 
 def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
                        img_size: int = 140) -> np.ndarray:
-    """
-    Project 3D world-coords (N, 3) to 2D pixel coords (N, 2) for `camera_name`.
-
-    Uses pinhole perspective; assumes a square image (img_size x img_size).
-    For Transport the rendered obs images are 140x140 uint8 (verified in
-    scripts/verify_rollout_data.py:129-136 and CLAUDE.md §7), so img_size=140
-    is the correct default.
+    """Project 3D world-coords (N, 3) to 2D pixel coords (N, 2) for `camera_name`.
 
     Convention notes:
-      - MuJoCo `cam_xmat` is the camera-to-world rotation stored as a
-        row-major flat 9-array; reshape(3,3) yields the cam→world matrix and
-        mat.T is world→cam.
-      - MuJoCo `cam_fovy` is the vertical field-of-view in degrees.
-      - Pixel coordinates follow image convention: +x right, +y down, origin
-        top-left. MuJoCo cameras use the OpenGL convention (camera looks
-        along -Z, +Y up, +X right), so visible points have z_cam < 0 and
-        we project with `depth = -z_cam` (positive).
-      - Transform application note: for NumPy `(N,3) @ (3,3)` the matrix
-        is applied to each row *as a column vector via the matrix's
-        transpose*. So to apply world→cam (`mat.T` in column-vector form)
-        to row vectors `p_rel`, we right-multiply by `mat` (NOT `mat.T`).
+      - MuJoCo `cam_xmat` columns are the cam axes in world (cam→world rotation).
+      - MuJoCo cameras use OpenGL convention (looks along -Z, +Y up, +X right);
+        visible points have z_cam < 0, so we project with `depth = -z_cam`.
+      - For NumPy row vectors, right-multiplying by `mat` applies `mat.T`
+        (= world→cam) — NOT `mat.T` which would be wrong.
     """
     pts = np.asarray(points_world, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
-        raise ValueError(
-            f"points_world must have shape (N, 3); got {pts.shape}.")
+        raise ValueError(f"points_world must have shape (N, 3); got {pts.shape}.")
 
     params = _get_camera_params(env, camera_name)
     pos = np.asarray(params['pos'], dtype=np.float64).reshape(3)
     mat = np.asarray(params['mat'], dtype=np.float64).reshape(3, 3)
     fovy = float(params['fovy'])
 
-    # World → camera frame.
-    # `mat` is MuJoCo's cam→world rotation (columns are cam axes in world).
-    # For NumPy row vectors (N,3)@(3,3), right-multiplying by `mat` applies
-    # `mat.T` (= world→cam) to each row as a column vector — which is what
-    # we want. (`p_rel @ mat.T` would apply `mat` to world-frame vectors,
-    # which is geometrically meaningless and yields out-of-frame pixels.)
     p_rel = pts - pos[None, :]
-    p_cam = p_rel @ mat  # (N, 3)
+    p_cam = p_rel @ mat  # apply world→cam to each row
 
-    # Vertical focal length from fovy (degrees). Square image so f_x = f_y.
     f = (img_size / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
 
-    # MuJoCo cameras look along -Z (OpenGL), so visible points have
-    # z_cam < 0. Use depth = -z_cam (positive) for the perspective divide.
     z = p_cam[:, 2]
     depth = -z
     valid = depth > 1e-6
@@ -549,6 +425,10 @@ def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
 
     return np.stack([px, py], axis=1)
 
+
+# ===========================================================================
+# Frame renderer — draws overlay trajectory on a single background image
+# ===========================================================================
 
 def _render_video_frame(
     bg_frame: np.ndarray,
@@ -563,44 +443,12 @@ def _render_video_frame(
 ) -> np.ndarray:
     """Compose one video frame: background image + overlay eef trajectory.
 
-    Background `bg_frame` is a uint8 (img_size, img_size, 3) RGB render from
-    `camera_name`. The `overlay_eef_world` array is shape (T, 2, 3) — T timesteps,
-    two robot arms, world xyz. We project every step to `camera_name` pixel
-    coords via `_project_to_camera`, then split into:
-        * "past"   = overlay[:current_step+1]   drawn solid, full alpha
-        * "future" = overlay[current_step+1:]   drawn dashed, alpha=0.35
-    Each arm gets a distinct marker ('o' for arm 0, 's' for arm 1) at the
-    `current_step` position so the two arms are visually distinguishable.
-
-    Color encodes time along the overlay trajectory (cmap depends on
-    `overlay_method`: 'lpb' -> plasma, 'base' -> viridis). No colorbar is
-    drawn (kept simple; the title annotates step index).
-
-    `scale` controls supersampling: output pixel size = img_size*scale.
-    E.g. img_size=140, scale=2 -> (280, 280, 3) uint8.
-
-    matplotlib API notes (server env has matplotlib=3.6.1 per
-    conda_environment.yaml):
-      - `FigureCanvasToBase.tostring_rgb()` is NOT deprecated in 3.6; it
-        was deprecated in 3.10. We use the more future-proof
-        `buffer_rgba()` + np.frombuffer + [..., :3] slice, which works on
-        3.6+ and avoids the deprecation entirely.
-      - LineCollection `linestyles=` accepts a single string ('-' or '--')
-        applied to ALL segments. The draft originally passed a 1-tuple
-        like `('-',)` which matplotlib interprets as a DashPattern tuple
-        and errors out. Fixed here by passing a plain string.
-      - `extent=[0, W, H, 0]` + `set_ylim(H, 0)` flips the imshow so the
-        pixel (0,0) is top-left, matching the projection convention in
-        `_project_to_camera` (px right, py down, origin top-left).
-
-    All matplotlib imports are inside the function because (a) we must set
-    the backend to 'Agg' before pyplot is first imported, and (b) it keeps
-    the top of this module importable on Windows (no matplotlib needed for
-    the static syntax check). The backend-set call is guarded so it only
-    runs once per process.
+    Past trajectory = overlay[:current_step+1]   drawn solid, full alpha.
+    Future = overlay[current_step+1:]            drawn dashed, alpha=0.35.
+    Each arm gets a distinct marker at `current_step` ('o' arm0, 's' arm1).
     """
     import matplotlib
-    matplotlib.use('Agg')  # headless; safe to call repeatedly
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection
     from matplotlib.colors import Normalize
@@ -610,26 +458,21 @@ def _render_video_frame(
     elif overlay_method == 'base':
         cmap_name = 'viridis'
     else:
-        raise ValueError(
-            f"overlay_method must be 'lpb' or 'base'; got {overlay_method!r}")
+        raise ValueError(f"overlay_method must be 'lpb' or 'base'; got {overlay_method!r}")
     cmap = plt.get_cmap(cmap_name)
 
-    # ---- project the entire overlay trajectory to this camera's pixels ----
-    # overlay_eef_world: (T, 2, 3) -> (T*2, 3) flat -> project -> (T, 2, 2)
     n_total = int(overlay_eef_world.shape[0])
     flat_pts = overlay_eef_world.reshape(n_total * 2, 3)
     flat_px = _project_to_camera(flat_pts, env, camera_name, img_size=img_size)
-    all_px = flat_px.reshape(n_total, 2, 2)  # (T, 2 arms, 2 px)
+    all_px = flat_px.reshape(n_total, 2, 2)
 
-    # ---- figure setup: img_size*scale pixels ----
     fig, ax = plt.subplots(
         figsize=(img_size * scale / 100.0, img_size * scale / 100.0),
         dpi=100,
     )
-    # imshow with extent flips y so (0,0) is top-left, matching projection.
     ax.imshow(bg_frame, extent=[0, img_size, img_size, 0])
     ax.set_xlim(0, img_size)
-    ax.set_ylim(img_size, 0)  # reversed: top-left origin
+    ax.set_ylim(img_size, 0)
     ax.set_xticks([])
     ax.set_yticks([])
     ax.set_aspect('equal')
@@ -642,19 +485,8 @@ def _render_video_frame(
 
     def _draw_arm_segments(points_px: np.ndarray, base_indices: np.ndarray,
                            linestyle: str, alpha: float):
-        """Draw both arms from `points_px` (T_seg, 2, 2).
-
-        Arm 0 uses linestyle as-is; arm 1 ALSO uses linestyle as-is. Earlier
-        draft tried to override to '--' for arm 1 but that conflicted with
-        the caller's linestyle arg. Both arms use the same linestyle here;
-        they are distinguishable by marker shape at `current_step`.
-
-        `base_indices` are the global step indices (for color mapping) that
-        correspond to rows of `points_px`.
-        """
         for arm_idx in range(2):
-            pts = points_px[:, arm_idx]  # (T_seg, 2)
-            # skip points that failed projection (px < 0 sentinel)
+            pts = points_px[:, arm_idx]
             valid = (pts[:, 0] >= 0) & (pts[:, 1] >= 0)
             if valid.sum() < 2:
                 continue
@@ -663,9 +495,6 @@ def _render_video_frame(
             seg_colors = cmap(norm(seg_idx))
             seg_colors[:, 3] = alpha
             segments = np.stack([seg_pts[:-1], seg_pts[1:]], axis=1)
-            # `linestyles` accepts a single string applied to all segments
-            # in matplotlib 3.6 (verified against the LineCollection
-            # docstring: "linestyles : linestyle or list of linestyles").
             lc = LineCollection(
                 segments,
                 colors=seg_colors[:-1],
@@ -674,18 +503,15 @@ def _render_video_frame(
             )
             ax.add_collection(lc)
 
-    # ---- past (solid, full alpha) ----
     if past_end > 0:
         idx = np.arange(past_end)
         _draw_arm_segments(all_px[:past_end], idx, linestyle='-', alpha=1.0)
 
-    # ---- future (dashed, faded) ----
     if future_end > future_start:
         idx = np.arange(future_start, future_end)
         _draw_arm_segments(
             all_px[future_start:future_end], idx, linestyle='--', alpha=0.35)
 
-    # ---- current position markers ----
     if 0 <= current_step < n_total:
         for arm_idx, marker in enumerate(['o', 's']):
             pt = all_px[current_step, arm_idx]
@@ -703,79 +529,65 @@ def _render_video_frame(
         fontsize=10,
     )
 
-    # ---- rasterize figure to uint8 (H, W, 3) ----
     fig.canvas.draw()
-    # buffer_rgba() is the non-deprecated path on mpl 3.6+; returns a
-    # memoryview of the renderer's RGBA buffer.
     rgba = np.asarray(fig.canvas.buffer_rgba())
-    out = rgba[:, :, :3].copy()  # drop alpha; copy to make C-contiguous
+    out = rgba[:, :, :3].copy()
     plt.close(fig)
     return out
 
 
+# ===========================================================================
+# Video composition — read LPB's MP4 + overlay base eef trajectory
+# ===========================================================================
+
 def _make_video(
-    driver_result: Dict,
-    overlay_result: Dict,
-    overlay_method: str,
+    lpb_video_path: str,
+    lpb_n_chunks: int,
+    base_eef_traj: np.ndarray,
     env,
-    view_names: List[str],
+    render_obs_key: str,
     cfg: DictConfig,
     output_path: str,
 ):
-    """Generate one MP4: driver's frames as background, overlay's eef trajectory projected.
+    """Read LPB's recorded MP4 frame-by-frame, overlay BASE policy's eef
+    trajectory (projected via `env`'s camera params), write composited MP4.
 
-    Iterates over `driver_result['frames'][view][t]` (background images from
-    the driver rollout) and composes a side-by-side panel of all `view_names`
-    cameras, with the `overlay_result['eef_traj']` drawn on top via
-    `_render_video_frame`.
-
-    Frame dimensions:
-        Single panel: img_size * cfg.video_frame_scale on each side
-        (e.g. 140 * 2 = 280). For len(view_names)=2 cameras, the final frame
-        is (280, 560, 3) uint8. `macro_block_size=1` is passed to imageio so
-        ffmpeg does not force the width/height to multiples of 16 (560 and
-        280 are not multiples of 16).
-
-    Length mismatch handling: the driver rollout may have more or fewer
-    sampled steps than the overlay. We iterate `t in range(n_frames)` (driver
-    length) and cap the overlay step at `overlay_n - 1`. If
-    `overlay_n == 0` we skip the video entirely (nothing to draw).
-
-    imageio API (verified for imageio 2.22.0 + imageio-ffmpeg 0.4.7 in
-    conda_environment.yaml):
-        `imageio.v2.get_writer(path, fps=..., codec='libx264', quality=N,
-        macro_block_size=1)` is the supported v2 API on this version.
-        `quality` is a 0-10 scale (lower = higher quality); we use 8 per the
-        design spec. `macro_block_size=1` disables the default multiple-of-16
-        padding.
-
-    Memory: imageio writes frames incrementally via ffmpeg, so we never hold
-    the full video in memory — only one composed frame at a time (~470 KB for
-    280x560x3 uint8).
-
-    Cleanup: writer.close() runs in a finally block so a mid-loop exception
-    still flushes the partial file (or closes the ffmpeg subprocess cleanly).
+    Frame ↔ chunk mapping: LPB's MP4 has `n_video_frames` frames recorded at
+    `steps_per_render` env-steps per frame. LPB ran `lpb_n_chunks` chunks of
+    `n_action_steps` env-steps each. So:
+        frames_per_chunk = n_video_frames / lpb_n_chunks
+        lpb_chunk_idx(f) = int(f / frames_per_chunk)
+    The overlay at frame f uses base_eef_traj[min(lpb_chunk_idx, base_n-1)]:
+    "where was base's arm at the same moment in its own rollout".
     """
-    import imageio.v2 as imageio  # v2 API for backward compat
+    import imageio.v2 as imageio
 
-    n_frames = int(driver_result['n_samples'])
-    overlay_n = int(overlay_result['n_samples'])
-
-    if n_frames == 0:
-        print(f"[video] SKIP: driver has 0 frames ({output_path})")
-        return
-    if overlay_n == 0:
-        print(f"[video] SKIP: overlay has 0 samples, nothing to draw ({output_path})")
+    if not os.path.exists(lpb_video_path):
+        print(f"[video] SKIP: LPB video not found at {lpb_video_path}")
         return
 
-    # img_size from driver frame H (frames are (T, H, W, 3) per _run_rollout).
-    # All views share the same H (Transport: 140), so we read from view 0.
-    img_size = int(driver_result['frames'][view_names[0]].shape[1])
-    out_h = img_size * cfg.video_frame_scale
-    out_w = img_size * cfg.video_frame_scale * len(view_names)
+    reader = imageio.get_reader(lpb_video_path)
+    n_video_frames = reader.count_frames()
+    base_n = int(base_eef_traj.shape[0])
 
-    print(f"[video] writing {output_path}: {n_frames} frames, "
-          f"{len(view_names)} views side-by-side, {out_h}x{out_w}px")
+    if n_video_frames == 0:
+        print(f"[video] SKIP: LPB video has 0 frames")
+        reader.close()
+        return
+    if base_n == 0:
+        print(f"[video] SKIP: base eef_traj has 0 samples")
+        reader.close()
+        return
+
+    # Read first frame to get img_size (Transport: 140x140).
+    first_frame = reader.get_data(0)
+    img_size = int(first_frame.shape[0])
+
+    frames_per_chunk = n_video_frames / max(lpb_n_chunks, 1)
+    print(f"[video] LPB video: {n_video_frames} frames, {img_size}x{img_size}px, "
+          f"fps={cfg.video_fps}")
+    print(f"[video] LPB ran {lpb_n_chunks} chunks; frames_per_chunk≈{frames_per_chunk:.2f}")
+    print(f"[video] base has {base_n} eef samples; overlaying as '{output_path}'")
 
     writer = imageio.get_writer(
         output_path,
@@ -786,37 +598,40 @@ def _make_video(
     )
 
     try:
-        for t in range(n_frames):
-            # Cap overlay step at last available index (handles driver outlasting overlay).
-            overlay_step = min(t, overlay_n - 1)
-            panels = []
-            for view in view_names:
-                bg = driver_result['frames'][view][t]
-                panel = _render_video_frame(
-                    bg_frame=bg,
-                    overlay_eef_world=overlay_result['eef_traj'],
-                    env=env,
-                    camera_name=view,
-                    current_step=overlay_step,
-                    total_overlay_steps=overlay_n,
-                    scale=cfg.video_frame_scale,
-                    overlay_method=overlay_method,
-                )
-                panels.append(panel)
-            # Horizontal stack: (out_h, out_w, 3). All panels are identical-shaped
-            # (out_h, out_h, 3) per _render_video_frame's contract.
-            frame = np.concatenate(panels, axis=1)
-            writer.append_data(frame)
+        for f in range(n_video_frames):
+            bg = reader.get_data(f)
+            # Map this video frame to LPB's chunk index.
+            lpb_chunk_idx = min(int(f / frames_per_chunk), lpb_n_chunks - 1)
+            # Base's chunk index at the same wall-clock moment: same chunk_idx,
+            # capped at base_n - 1 (if base ran fewer chunks).
+            base_chunk_idx = min(lpb_chunk_idx, base_n - 1)
 
-            if t % 20 == 0:
-                print(f"  [video] frame {t}/{n_frames}")
+            panel = _render_video_frame(
+                bg_frame=bg,
+                overlay_eef_world=base_eef_traj,
+                env=env,
+                camera_name=render_obs_key,
+                current_step=base_chunk_idx,
+                total_overlay_steps=base_n,
+                scale=cfg.video_frame_scale,
+                overlay_method='base',
+                img_size=img_size,
+            )
+            writer.append_data(panel)
+
+            if f % 50 == 0:
+                print(f"  [video] frame {f}/{n_video_frames} "
+                      f"(lpb_chunk={lpb_chunk_idx}, base_chunk={base_chunk_idx})")
     finally:
-        # Ensure the ffmpeg subprocess is closed even on exception so we don't
-        # leak a hung writer or leave the file half-flushed without close().
         writer.close()
+        reader.close()
 
-    print(f"[video] wrote {output_path} ({n_frames} frames)")
+    print(f"[video] wrote {output_path} ({n_video_frames} frames)")
 
+
+# ===========================================================================
+# Main
+# ===========================================================================
 
 @hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
 def main(cfg: DictConfig):
@@ -826,33 +641,46 @@ def main(cfg: DictConfig):
     print(OmegaConf.to_yaml(cfg))
 
     pathlib.Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
-    # Save config
     OmegaConf.save(cfg, os.path.join(cfg.output_dir, 'compare_config.yaml'))
 
-    # ---- Phase 1: base rollout ----
-    print("\n[Phase 1] Loading base policy + running base rollout...")
-    base_policy, cfg_task = _load_base_policy(cfg)
-    env, _ = _build_env(cfg_task, cfg, seed=cfg.compare_seed)
-    base_result = _run_rollout(base_policy, env, cfg, use_guidance=False, label='base')
-    del base_policy
-    torch.cuda.empty_cache()
-
-    # ---- Phase 2: LPB rollout ----
-    print("\n[Phase 2] Loading LPB policy + running LPB rollout...")
-    lpb_policy, _ = _load_lpb_policy(cfg)
-    env2, _ = _build_env(cfg_task, cfg, seed=cfg.compare_seed)
-    lpb_result = _run_rollout(lpb_policy, env2, cfg, use_guidance=True, label='lpb')
+    # ---- Phase 1: LPB rollout (records MP4 via standard VideoRecordingWrapper) ----
+    print("\n[Phase 1] Loading LPB policy + running LPB rollout (records video)...")
+    lpb_policy, cfg_task = _load_lpb_policy(cfg)
+    lpb_env, render_obs_key, n_action_steps, steps_per_render = _build_env(cfg_task, cfg)
+    lpb_video_path = os.path.join(cfg.output_dir, 'lpb_driver.mp4')
+    lpb_result = _run_rollout(
+        lpb_policy, lpb_env, cfg, use_guidance=True, label='lpb',
+        video_path=lpb_video_path,
+    )
     del lpb_policy
     torch.cuda.empty_cache()
 
+    # ---- Phase 2: base rollout (same seed, no video, only eef sampling) ----
+    print("\n[Phase 2] Loading base policy + running base rollout (eef only)...")
+    base_policy, _ = _load_base_policy(cfg)
+    base_env, _, _, _ = _build_env(cfg_task, cfg)
+    base_result = _run_rollout(
+        base_policy, base_env, cfg, use_guidance=False, label='base',
+        video_path=None,
+    )
+    del base_policy
+    torch.cuda.empty_cache()
+
     # ---- Phase 3: sanity check projection ----
+    # Project base's first eef sample to render_obs_key; should land in-frame.
     print("\n[Phase 3] Projection sanity check...")
-    cam = cfg.render_views[0]
-    eef0 = base_result['eef_traj'][0, 0]
-    px = _project_to_camera(eef0.reshape(1, 3), env, cam)[0]
-    assert 0 <= px[0] < 140 and 0 <= px[1] < 140, \
-        f"Projection sanity check failed: {px}"
-    print(f"  OK: world {eef0} -> px {px}")
+    if base_result['n_samples'] > 0:
+        eef0 = base_result['eef_traj'][0, 0]
+        px = _project_to_camera(eef0.reshape(1, 3), lpb_env, render_obs_key)[0]
+        print(f"  world {eef0} -> px {px} (camera={render_obs_key})")
+        # Soft warning (not hard assert) — out-of-frame projection of eef0
+        # doesn't necessarily break the video; the renderer skips invalid pts.
+        if not (0 <= px[0] < 140 and 0 <= px[1] < 140):
+            print(f"  WARN: eef0 projects out of frame; overlay will be sparse.")
+        else:
+            print(f"  OK")
+    else:
+        print("  SKIP: base rollout produced 0 samples")
 
     # ---- Phase 4: save rollout data ----
     print("\n[Phase 4] Saving rollout data...")
@@ -868,37 +696,31 @@ def main(cfg: DictConfig):
         lpb_success_step=lpb_result['success_step'],
     )
 
-    # ---- Phase 5: render videos ----
-    print("\n[Phase 5a] Video 1: base driving, LPB overlay...")
-    _make_video(
-        driver_result=base_result,
-        overlay_result=lpb_result,
-        overlay_method='lpb',
-        env=env,
-        view_names=list(cfg.render_views),
-        cfg=cfg,
-        output_path=os.path.join(cfg.output_dir, 'base_driving_lpb_overlay.mp4'),
-    )
+    # ---- Phase 5: compose video (LPB driving + base overlay) ----
+    print("\n[Phase 5] Composing video: LPB driving + base overlay...")
+    if lpb_result['video_path'] is None or not os.path.exists(lpb_result['video_path']):
+        print(f"[Phase 5] SKIP: LPB did not produce a video "
+              f"(video_path={lpb_result['video_path']})")
+    else:
+        _make_video(
+            lpb_video_path=lpb_result['video_path'],
+            lpb_n_chunks=lpb_result['n_steps'],
+            base_eef_traj=base_result['eef_traj'],
+            env=lpb_env,  # use LPB's env for camera projection (fixed cameras)
+            render_obs_key=render_obs_key,
+            cfg=cfg,
+            output_path=os.path.join(cfg.output_dir, 'lpb_driving_base_overlay.mp4'),
+        )
 
-    print("\n[Phase 5b] Video 2: LPB driving, base overlay...")
-    _make_video(
-        driver_result=lpb_result,
-        overlay_result=base_result,
-        overlay_method='base',
-        env=env2,
-        view_names=list(cfg.render_views),
-        cfg=cfg,
-        output_path=os.path.join(cfg.output_dir, 'lpb_driving_base_overlay.mp4'),
-    )
-
+    # ---- Summary ----
     print("\n" + "=" * 60)
     print("DONE")
     print(f"  Output dir: {cfg.output_dir}")
-    print(f"  - base_driving_lpb_overlay.mp4 ({base_result['n_samples']} frames)")
-    print(f"  - lpb_driving_base_overlay.mp4 ({lpb_result['n_samples']} frames)")
+    print(f"  - lpb_driver.mp4 (raw LPB rollout, {lpb_result['n_steps']} chunks)")
+    print(f"  - lpb_driving_base_overlay.mp4 (LPB video + base eef overlay)")
     print(f"  - rollout_data.npz")
-    print(f"  Base success: {base_result['success']} @ step {base_result['success_step']}")
     print(f"  LPB  success: {lpb_result['success']} @ step {lpb_result['success_step']}")
+    print(f"  Base success: {base_result['success']} @ step {base_result['success_step']}")
     print("=" * 60)
 
 
