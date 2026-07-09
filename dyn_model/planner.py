@@ -151,7 +151,7 @@ class Planner:
 
         if len(self.demo_visual_latents.shape) > 2:
             self.demo_visual_latents = self.demo_visual_latents.reshape(self.demo_visual_latents.size(0), -1)
-            if 'ToolHang' in self.env_name:
+            if 'ToolHang' in self.env_name or 'Square' in self.env_name:
                 self.demo_visual_latents = self.demo_visual_latents[...,512:]
             elif 'Transport' in self.env_name:
                 self.demo_visual_latents = self.demo_visual_latents[...,:1024]
