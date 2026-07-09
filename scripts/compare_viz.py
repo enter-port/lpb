@@ -1,31 +1,33 @@
 """
-Compare LPB vs Base Policy — generate ONE visualization video.
+compare_viz — visualize LPB vs base policy divergence.
 
-The video shows LPB (base + dynamics model + classifier guidance) driving the
-env from a seed-initialized state, recorded at full env fps via the standard
-`VideoRecordingWrapper` (same path as `eval_test_time_optimization.py`). The
-BASE policy's eef trajectory — obtained from a second rollout started from the
-SAME seed but run WITHOUT guidance — is projected onto the video as a colored
-polyline (past = solid, future = dashed).
+Generates ONE video: LPB (base + dynamics + classifier guidance) drives the
+env from a seed-initialized state (recorded at full env fps via the standard
+`VideoRecordingWrapper`), with the BASE policy's eef trajectory overlaid as a
+colored polyline (past = solid, future = dashed).
 
-Pipeline:
-    1. Build env via the standard `create_env` factory.
-    2. LPB rollout:  set file_path -> env records MP4 at full fps; sample eef
-                     every chunk for diagnostics.
-    3. Base rollout: separate env instance, same seed, no video recording,
-                     sample eef every chunk.
-    4. Sanity-check the camera projection.
-    5. Read LPB's MP4 frame-by-frame, overlay base's eef trajectory, write MP4.
+Two modes:
+  - Default (find_divergent_seed=false): use cfg.compare_seed directly.
+  - Divergent search (find_divergent_seed=true): try seeds starting from
+    cfg.compare_seed, increment by 1 until LPB succeeds AND base fails, then
+    visualize that trajectory. Bases that succeed are skipped (no LPB run);
+    this minimizes the expensive LPB rolloffs.
 
-See docs/superpowers/specs/2026-07-06-lpb-vs-base-comparison-design.md
+Cross-env compatibility: works for any task (transport, square, tool_hang,
+libero, ...) given a matching compare_<env>.yaml. The env-specific fields
+are read from the policy checkpoint's task config or the compare yaml:
+  - render_obs_key  ← cfg.task.env_runner.render_obs_key
+  - abs_action      ← cfg.task.env_runner.abs_action
+  - n_action_steps  ← cfg.n_action_steps (top-level, in compare_<env>.yaml)
 
 Usage:
-    python compare_lpb_vs_base.py --config-name=compare_transport
-    python compare_lpb_vs_base.py --config-name=compare_transport compare_seed=100001
+    python scripts/compare_viz.py --config-name=compare_transport
+    python scripts/compare_viz.py --config-name=compare_transport find_divergent_seed=true
+    python scripts/compare_viz.py --config-name=compare_transport \\
+        find_divergent_seed=true max_seed_search=100
 """
-import sys
 import os
-import json
+import sys
 import pathlib
 from typing import Dict, List, Optional, Tuple
 
@@ -42,9 +44,14 @@ from diffusion_policy.env_runner.robomimic_image_sequential_runner import create
 sys.stdout = open(sys.stdout.fileno(), mode='w', buffering=1)
 sys.stderr = open(sys.stderr.fileno(), mode='w', buffering=1)
 
+# Hydra config path is anchored to the repo root, regardless of where the
+# script is invoked from. This file lives at <root>/scripts/compare_viz.py.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_CONFIG_DIR = os.path.join(_REPO_ROOT, "dyn_model", "conf", "planner")
+
 
 # ===========================================================================
-# Policy loaders (unchanged from previous version)
+# Policy loaders
 # ===========================================================================
 
 def _load_policy_payload(policy_checkpoint: str):
@@ -59,12 +66,14 @@ def _load_policy_payload(policy_checkpoint: str):
 def _apply_common_overrides(cfg_task, cfg: DictConfig):
     """Override stale .ckpt paths and inject eval-time fields (CLAUDE.md §6.1).
 
-    Mirrors the inline overrides in eval_base_policy.py and
-    eval_test_time_optimization.py. Mutates `cfg_task` in place and returns it.
+    n_action_steps is read from cfg (top-level field in compare_<env>.yaml),
+    NOT hardcoded — different envs use different chunk sizes (transport=15,
+    square=8, etc.).
     """
-    cfg_task.n_action_steps = 15
-    cfg_task.policy.n_action_steps = 15
-    cfg_task.task.env_runner.n_action_steps = 15
+    n_action_steps = cfg.get('n_action_steps', 8)
+    cfg_task.n_action_steps = n_action_steps
+    cfg_task.policy.n_action_steps = n_action_steps
+    cfg_task.task.env_runner.n_action_steps = n_action_steps
     cfg_task.task.env_runner.dataset_path = cfg.demo_dataset_path
     cfg_task.task.dataset.dataset_path = cfg.demo_dataset_path
     return cfg_task
@@ -93,7 +102,6 @@ def _load_base_policy(cfg: DictConfig):
     policy.normalizer.load_state_dict(torch.load(normalizer_path))
     policy.normalizer.to(device)
 
-    # Deliberately do NOT call policy.initialize_planner(...)
     print("[loader] Base policy loaded (no planner)")
     return policy, cfg_task
 
@@ -143,16 +151,15 @@ def _load_lpb_policy(cfg: DictConfig):
 # Env construction — thin wrapper around the standard runner's create_env
 # ===========================================================================
 
-def _build_env(cfg_task, cfg: DictConfig) -> Tuple[object, str, int, int]:
-    """Build env via the standard `create_env` factory from
-    `robomimic_image_sequential_runner`.
+def _build_env(cfg_task, cfg: DictConfig):
+    """Build env via the standard `create_env` factory.
 
     Does NOT seed or reset — the caller does that AFTER setting
-    `env.env.file_path` so that VideoRecordingWrapper records.
+    `env.env.file_path` so VideoRecordingWrapper records.
 
-    Returns (env, render_obs_key, n_action_steps, steps_per_render).
-    Wrapper stack (outside-in): MultiStepWrapper → VideoRecordingWrapper
-    → RobomimicImageWrapper → EnvRobosuite. So `env.env` IS the
+    Returns (env, render_obs_key, n_action_steps, steps_per_render). Wrapper
+    stack (outside-in): MultiStepWrapper → VideoRecordingWrapper
+    → RobomimicImageWrapper → EnvRobosuite. `env.env` is the
     VideoRecordingWrapper (where `file_path` lives).
     """
     import robomimic.utils.file_utils as FileUtils
@@ -160,12 +167,9 @@ def _build_env(cfg_task, cfg: DictConfig) -> Tuple[object, str, int, int]:
     env_runner_cfg = cfg_task.task.env_runner
     dataset_path = os.path.expanduser(env_runner_cfg.dataset_path)
 
-    # Read env_meta and apply abs_action controller tweak (same as sequential
-    # runner __init__: control_delta=False makes the env consume rotation_6d
-    # actions directly).
     env_meta = FileUtils.get_env_metadata_from_dataset(dataset_path)
     env_meta['env_kwargs']['use_object_obs'] = False
-    abs_action = getattr(env_runner_cfg, 'abs_action', True)
+    abs_action = getattr(env_runner_cfg, 'abs_action', False)
     if abs_action:
         env_meta['env_kwargs']['controller_configs']['control_delta'] = False
 
@@ -189,16 +193,12 @@ def _build_env(cfg_task, cfg: DictConfig) -> Tuple[object, str, int, int]:
         max_steps=max_steps,
     )
 
-    # Robosuite hard reset causes excessive memory consumption; disable
-    # (same as sequential runner __init__).
-    # create_env already does env.env.hard_reset=False on the EnvRobosuite,
-    # so this is just informational.
     steps_per_render = max(20 // fps, 1)
 
     print(f"[env] Built env via create_env. render_obs_key={render_obs_key}, "
-          f"n_action_steps={n_action_steps}, fps={fps}, steps_per_render={steps_per_render}, "
-          f"max_steps={max_steps}")
-    return env, render_obs_key, n_action_steps, steps_per_render
+          f"abs_action={abs_action}, n_action_steps={n_action_steps}, "
+          f"fps={fps}, steps_per_render={steps_per_render}, max_steps={max_steps}")
+    return env, render_obs_key, n_action_steps, steps_per_render, abs_action
 
 
 # ===========================================================================
@@ -206,38 +206,35 @@ def _build_env(cfg_task, cfg: DictConfig) -> Tuple[object, str, int, int]:
 # ===========================================================================
 
 def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
-                 video_path: Optional[str] = None) -> Dict:
-    """Run a rollout. If `video_path` is set, the env records at full fps to
-    that MP4 via VideoRecordingWrapper (file_path must be assigned BEFORE
-    reset, since reset() stops any prior recorder).
+                 abs_action: bool, video_path: Optional[str] = None) -> Dict:
+    """Run a rollout. If `video_path` is set, env records at full fps to that
+    MP4 via VideoRecordingWrapper (file_path must be assigned BEFORE reset,
+    since reset() stops any prior recorder).
 
     `env` MUST already be built. We re-seed with cfg.compare_seed here so the
     same env instance can be reused for both rollouts.
 
-    The env is a MultiStepWrapper, so one env.step() call consumes
-    `n_action_steps` underlying robosuite steps with one action chunk
-    `(n_action_steps, action_dim)`; we treat that as one "chunk" / decision
-    step. cfg.max_steps caps the number of chunks.
+    One env.step() consumes `n_action_steps` underlying robosuite steps; we
+    treat that as one "chunk" / decision step. cfg.max_steps caps chunks.
 
     Returns a dict with keys:
-        eef_traj      (T, 2, 3) float  - sampled robot0/robot1 eef xyz per chunk
-        actions       (T, action_dim_env) float - env-space action chunks per chunk
+        eef_traj      (T, 2, 3) float  - robot0/robot1 eef xyz per chunk
+        actions       (T, action_dim_env) float
         success       bool
         success_step  int  (-1 if never succeeded)
-        n_steps       int  - total env.step() chunks executed (== T unless break)
-        n_samples     int  - == eef_traj.shape[0] == T
-        video_path    Optional[str] - the recorded MP4 path (None if not recording)
+        n_steps       int  - chunks executed
+        n_samples     int  - == eef_traj.shape[0]
+        video_path    Optional[str]
     """
     from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 
-    # ---- abs_action / rotation transformer (mirrors sequential runner) ----
-    abs_action = True
     rotation_transformer = RotationTransformer('axis_angle', 'rotation_6d') if abs_action else None
 
     def undo_transform_action(action: np.ndarray) -> np.ndarray:
-        """rotation_6d (...,20) -> axis_angle (...,14). Mirrors sequential runner."""
+        """rotation_6d (...,20 or 10) -> axis_angle (...,14 or 7). Mirrors runner."""
         raw_shape = action.shape
         if raw_shape[-1] == 20:
+            # dual arm
             action = action.reshape(*raw_shape[:-1], 2, 10)
         d_rot = action.shape[-1] - 4
         pos = action[..., :3]
@@ -249,14 +246,12 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
             uaction = uaction.reshape(*raw_shape[:-1], 14)
         return uaction
 
-    # ---- set video file_path BEFORE reset ----
-    # env.env is VideoRecordingWrapper (MultiStepWrapper.env).
-    # If file_path is None, no frames are recorded.
+    # ---- set video file_path BEFORE reset (env.env = VideoRecordingWrapper) ----
     env.env.file_path = video_path
     if video_path is not None:
         print(f"[rollout:{label}] env will record to {video_path}")
 
-    # ---- seed + reset (deterministic re-roll) ----
+    # ---- seed + reset ----
     env.seed(cfg.compare_seed)
     obs = env.reset()
     policy.reset()
@@ -268,35 +263,27 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
     n_chunks = 0
 
     print(f"[rollout:{label}] starting. use_guidance={use_guidance}, "
-          f"max_chunks={cfg.max_steps}")
+          f"abs_action={abs_action}, max_chunks={cfg.max_steps}, seed={cfg.compare_seed}")
 
     for chunk_idx in range(cfg.max_steps):
-        # ---- build obs dict (B=1, To, ...) ----
         np_obs_dict = {k: np.expand_dims(v, axis=0) for k, v in obs.items()}
         obs_dict = {k: torch.from_numpy(v).to(policy.device) for k, v in np_obs_dict.items()}
 
-        # ---- policy forward ----
-        # predict_action_dyn_guided uses grad internally (for classifier
-        # guidance), so we do NOT wrap it in torch.no_grad(). predict_action
-        # is pure DDPM sampling and benefits from no_grad.
         if use_guidance:
             action_dict = policy.predict_action_dyn_guided(obs_dict)
         else:
             with torch.no_grad():
                 action_dict = policy.predict_action(obs_dict)
 
-        # action shape: (1, n_action_steps, action_dim_policy); squeeze batch.
         action = action_dict['action'][0].detach().to('cpu').numpy()
         if not np.all(np.isfinite(action)):
             raise RuntimeError(
                 f"[rollout:{label}] NaN/Inf in policy action at chunk {chunk_idx}")
 
-        # ---- env step ----
         env_action = undo_transform_action(action) if abs_action else action
         obs, reward, done, info = env.step(env_action)
         n_chunks += 1
 
-        # ---- sample eef + action EVERY chunk (smoothest overlay trajectory) ----
         eef = np.stack([
             obs['robot0_eef_pos'][-1].copy(),
             obs['robot1_eef_pos'][-1].copy(),
@@ -304,7 +291,6 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
         eef_list.append(eef)
         actions_list.append(env_action.copy())
 
-        # ---- success / termination ----
         try:
             cur_success = bool(env.env.env.get_success_label())
         except (AttributeError, RuntimeError) as e:
@@ -318,20 +304,17 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
             break
 
         if bool(np.all(done)):
-            print(f"[rollout:{label}] env returned done=True at chunk {chunk_idx} (truncated/terminated)")
+            print(f"[rollout:{label}] env done=True at chunk {chunk_idx}")
             break
 
-    # ---- finalize video ----
-    # env.render() on MultiStepWrapper delegates down to VideoRecordingWrapper.render,
-    # which stops the recorder (flushing the MP4) and returns the file_path.
+    # env.render() stops the recorder (flushing the MP4) and returns file_path.
     final_video_path = env.render() if video_path is not None else None
 
-    # ---- pack outputs ----
     eef_traj = np.stack(eef_list) if eef_list else np.zeros((0, 2, 3), dtype=np.float32)
     actions = np.stack(actions_list) if actions_list else np.zeros((0, 14), dtype=np.float32)
 
-    print(f"[rollout:{label}] done. n_chunks={n_chunks}, sampled_points={len(eef_list)}, "
-          f"success={success}, success_step={success_step}")
+    print(f"[rollout:{label}] done. n_chunks={n_chunks}, success={success}, "
+          f"success_step={success_step}")
     return {
         'eef_traj': eef_traj,
         'actions': actions,
@@ -348,8 +331,7 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
 # ===========================================================================
 
 def _get_camera_params(env, camera_name: str) -> Dict:
-    """Extract camera position (3,), orientation (3, 3), fovy (scalar) from the
-    MuJoCo sim underlying the wrapper stack."""
+    """Extract camera pos (3,), mat (3,3), fovy (scalar) from the MuJoCo sim."""
     node = env
     sim = None
     for _ in range(8):
@@ -391,15 +373,12 @@ def _get_camera_params(env, camera_name: str) -> Dict:
 
 
 def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
-                       img_size: int = 140) -> np.ndarray:
-    """Project 3D world-coords (N, 3) to 2D pixel coords (N, 2) for `camera_name`.
+                       img_size: int) -> np.ndarray:
+    """Project 3D world-coords (N, 3) to 2D pixel coords (N, 2).
 
-    Convention notes:
-      - MuJoCo `cam_xmat` columns are the cam axes in world (cam→world rotation).
-      - MuJoCo cameras use OpenGL convention (looks along -Z, +Y up, +X right);
-        visible points have z_cam < 0, so we project with `depth = -z_cam`.
-      - For NumPy row vectors, right-multiplying by `mat` applies `mat.T`
-        (= world→cam) — NOT `mat.T` which would be wrong.
+    MuJoCo cameras use OpenGL convention (looks along -Z); visible points have
+    z_cam < 0, so we project with `depth = -z_cam`. For NumPy row vectors,
+    right-multiplying by `mat` applies `mat.T` (= world→cam).
     """
     pts = np.asarray(points_world, dtype=np.float64)
     if pts.ndim != 2 or pts.shape[1] != 3:
@@ -411,7 +390,7 @@ def _project_to_camera(points_world: np.ndarray, env, camera_name: str,
     fovy = float(params['fovy'])
 
     p_rel = pts - pos[None, :]
-    p_cam = p_rel @ mat  # apply world→cam to each row
+    p_cam = p_rel @ mat  # world→cam for row vectors
 
     f = (img_size / 2.0) / np.tan(np.deg2rad(fovy) / 2.0)
 
@@ -439,13 +418,12 @@ def _render_video_frame(
     total_overlay_steps: int,
     scale: int,
     overlay_method: str,  # 'lpb' or 'base'
-    img_size: int = 140,
+    img_size: int,
 ) -> np.ndarray:
     """Compose one video frame: background image + overlay eef trajectory.
 
-    Past trajectory = overlay[:current_step+1]   drawn solid, full alpha.
-    Future = overlay[current_step+1:]            drawn dashed, alpha=0.35.
-    Each arm gets a distinct marker at `current_step` ('o' arm0, 's' arm1).
+    Past = overlay[:current_step+1]   solid, full alpha.
+    Future = overlay[current_step+1:] dashed, alpha=0.35.
     """
     import matplotlib
     matplotlib.use('Agg')
@@ -453,12 +431,7 @@ def _render_video_frame(
     from matplotlib.collections import LineCollection
     from matplotlib.colors import Normalize
 
-    if overlay_method == 'lpb':
-        cmap_name = 'plasma'
-    elif overlay_method == 'base':
-        cmap_name = 'viridis'
-    else:
-        raise ValueError(f"overlay_method must be 'lpb' or 'base'; got {overlay_method!r}")
+    cmap_name = 'plasma' if overlay_method == 'lpb' else 'viridis'
     cmap = plt.get_cmap(cmap_name)
 
     n_total = int(overlay_eef_world.shape[0])
@@ -549,16 +522,10 @@ def _make_video(
     cfg: DictConfig,
     output_path: str,
 ):
-    """Read LPB's recorded MP4 frame-by-frame, overlay BASE policy's eef
-    trajectory (projected via `env`'s camera params), write composited MP4.
+    """Read LPB's MP4 frame-by-frame, overlay BASE policy's eef trajectory,
+    write composited MP4.
 
-    Frame ↔ chunk mapping: LPB's MP4 has `n_video_frames` frames recorded at
-    `steps_per_render` env-steps per frame. LPB ran `lpb_n_chunks` chunks of
-    `n_action_steps` env-steps each. So:
-        frames_per_chunk = n_video_frames / lpb_n_chunks
-        lpb_chunk_idx(f) = int(f / frames_per_chunk)
-    The overlay at frame f uses base_eef_traj[min(lpb_chunk_idx, base_n-1)]:
-    "where was base's arm at the same moment in its own rollout".
+    Frame ↔ chunk: frames_per_chunk = n_video_frames / lpb_n_chunks.
     """
     import imageio.v2 as imageio
 
@@ -579,7 +546,6 @@ def _make_video(
         reader.close()
         return
 
-    # Read first frame to get img_size (Transport: 140x140).
     first_frame = reader.get_data(0)
     img_size = int(first_frame.shape[0])
 
@@ -600,10 +566,7 @@ def _make_video(
     try:
         for f in range(n_video_frames):
             bg = reader.get_data(f)
-            # Map this video frame to LPB's chunk index.
             lpb_chunk_idx = min(int(f / frames_per_chunk), lpb_n_chunks - 1)
-            # Base's chunk index at the same wall-clock moment: same chunk_idx,
-            # capped at base_n - 1 (if base ran fewer chunks).
             base_chunk_idx = min(lpb_chunk_idx, base_n - 1)
 
             panel = _render_video_frame(
@@ -630,62 +593,176 @@ def _make_video(
 
 
 # ===========================================================================
+# Divergent seed search — find a seed where LPB succeeds AND base fails
+# ===========================================================================
+
+def _try_one_seed(cfg, cfg_task, base_policy, lpb_policy, abs_action: bool,
+                  output_dir: str, seed: int) -> Optional[Dict]:
+    """Try one seed. Returns dict with everything needed for visualization if
+    LPB succeeded AND base failed; returns None otherwise.
+
+    Strategy: run base first (cheaper, no guidance). If base succeeded, skip
+    (we need base to fail). Only run LPB if base failed.
+
+    On success, the LPB env is RETAINED (caller needs it for camera projection
+    during Phase 5). On failure, envs are cleaned up.
+    """
+    cfg.compare_seed = seed  # _run_rollout reads this
+
+    # ---- base rollout (no video) ----
+    base_env, _, _, _, _ = _build_env(cfg_task, cfg)
+    base_result = _run_rollout(
+        base_policy, base_env, cfg, use_guidance=False,
+        label=f'base_s{seed}', abs_action=abs_action, video_path=None,
+    )
+    del base_env
+    torch.cuda.empty_cache()
+
+    if base_result['success']:
+        print(f"[search:seed={seed}] base SUCCEEDED -> skip (need base to fail)")
+        return None
+
+    # ---- base failed; try LPB (with video) ----
+    lpb_env, _, _, _, _ = _build_env(cfg_task, cfg)
+    lpb_video_path = os.path.join(output_dir, f'lpb_driver_s{seed}.mp4')
+    lpb_result = _run_rollout(
+        lpb_policy, lpb_env, cfg, use_guidance=True,
+        label=f'lpb_s{seed}', abs_action=abs_action, video_path=lpb_video_path,
+    )
+
+    if lpb_result['success']:
+        print(f"[search:seed={seed}] LPB SUCCEEDED + base FAILED -> DIVERGENT!")
+        return {
+            'seed': seed,
+            'base_result': base_result,
+            'lpb_result': lpb_result,
+            'lpb_env': lpb_env,           # retained for Phase 5 projection
+            'lpb_video_path': lpb_video_path,
+        }
+
+    # both failed; cleanup
+    print(f"[search:seed={seed}] both failed -> continue searching")
+    del lpb_env
+    torch.cuda.empty_cache()
+    if os.path.exists(lpb_video_path):
+        os.remove(lpb_video_path)
+    return None
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 
-@hydra.main(config_path="dyn_model/conf/planner", config_name="compare_transport")
+@hydra.main(config_path=_CONFIG_DIR, config_name="compare_transport")
 def main(cfg: DictConfig):
     print("=" * 60)
-    print("LPB vs Base Policy Comparison")
+    print("compare_viz — LPB vs Base Policy")
     print("=" * 60)
     print(OmegaConf.to_yaml(cfg))
 
     pathlib.Path(cfg.output_dir).mkdir(parents=True, exist_ok=True)
     OmegaConf.save(cfg, os.path.join(cfg.output_dir, 'compare_config.yaml'))
 
-    # ---- Phase 1: LPB rollout (records MP4 via standard VideoRecordingWrapper) ----
-    print("\n[Phase 1] Loading LPB policy + running LPB rollout (records video)...")
-    lpb_policy, cfg_task = _load_lpb_policy(cfg)
-    lpb_env, render_obs_key, n_action_steps, steps_per_render = _build_env(cfg_task, cfg)
-    lpb_video_path = os.path.join(cfg.output_dir, 'lpb_driver.mp4')
-    lpb_result = _run_rollout(
-        lpb_policy, lpb_env, cfg, use_guidance=True, label='lpb',
-        video_path=lpb_video_path,
-    )
-    del lpb_policy
-    torch.cuda.empty_cache()
+    # Always need base policy + cfg_task to discover env flags
+    print("\n[init] Loading base policy...")
+    base_policy, cfg_task = _load_base_policy(cfg)
 
-    # ---- Phase 2: base rollout (same seed, no video, only eef sampling) ----
-    print("\n[Phase 2] Loading base policy + running base rollout (eef only)...")
-    base_policy, _ = _load_base_policy(cfg)
-    base_env, _, _, _ = _build_env(cfg_task, cfg)
-    base_result = _run_rollout(
-        base_policy, base_env, cfg, use_guidance=False, label='base',
-        video_path=None,
-    )
-    del base_policy
-    torch.cuda.empty_cache()
+    find_divergent = bool(cfg.get('find_divergent_seed', False))
 
-    # ---- Phase 3: sanity check projection ----
-    # Project base's first eef sample to render_obs_key; should land in-frame.
+    if find_divergent:
+        # ---- divergent-seed search mode ----
+        print("\n[init] Loading LPB policy (for search)...")
+        lpb_policy, _ = _load_lpb_policy(cfg)
+
+        # Probe one env build to discover abs_action etc. cheaply (we don't
+        # actually run a rollout here; we just read cfg_task flags).
+        abs_action = getattr(cfg_task.task.env_runner, 'abs_action', False)
+        render_obs_key = cfg_task.task.env_runner.render_obs_key
+        print(f"[init] render_obs_key={render_obs_key}, abs_action={abs_action}")
+
+        max_search = int(cfg.get('max_seed_search', 50))
+        print(f"\n[search] find_divergent_seed=True, start_seed={cfg.compare_seed}, "
+              f"max_attempts={max_search}")
+
+        found = None
+        for offset in range(max_search):
+            seed = cfg.compare_seed + offset
+            print(f"\n[search] === attempt {offset+1}/{max_search}, seed={seed} ===")
+            found = _try_one_seed(
+                cfg, cfg_task, base_policy, lpb_policy,
+                abs_action=abs_action, output_dir=cfg.output_dir, seed=seed,
+            )
+            if found is not None:
+                break
+
+        # Free both policies — visualization only needs env + results.
+        del base_policy, lpb_policy
+        torch.cuda.empty_cache()
+
+        if found is None:
+            print(f"\n[search] FAILED: no divergent seed found in {max_search} attempts.")
+            print(f"[search] Try raising max_seed_search or compare_seed.")
+            return
+
+        seed_used = found['seed']
+        base_result = found['base_result']
+        lpb_result = found['lpb_result']
+        lpb_env = found['lpb_env']
+        print(f"\n[search] === FOUND divergent seed: {seed_used} ===")
+
+    else:
+        # ---- direct mode: use cfg.compare_seed as-is ----
+        abs_action = getattr(cfg_task.task.env_runner, 'abs_action', False)
+        render_obs_key = cfg_task.task.env_runner.render_obs_key
+        seed_used = cfg.compare_seed
+        print(f"\n[run] find_divergent_seed=False; using seed={seed_used} directly")
+        print(f"[run] render_obs_key={render_obs_key}, abs_action={abs_action}")
+
+        base_env, _, _, _, _ = _build_env(cfg_task, cfg)
+        base_result = _run_rollout(
+            base_policy, base_env, cfg, use_guidance=False,
+            label='base', abs_action=abs_action, video_path=None,
+        )
+        del base_policy, base_env
+        torch.cuda.empty_cache()
+
+        print("\n[run] Loading LPB policy...")
+        lpb_policy, _ = _load_lpb_policy(cfg)
+        lpb_env, _, _, _, _ = _build_env(cfg_task, cfg)
+        lpb_video_path = os.path.join(cfg.output_dir, 'lpb_driver.mp4')
+        lpb_result = _run_rollout(
+            lpb_policy, lpb_env, cfg, use_guidance=True,
+            label='lpb', abs_action=abs_action, video_path=lpb_video_path,
+        )
+        del lpb_policy
+        torch.cuda.empty_cache()
+
+    # ===========================================================================
+    # Phase 3: sanity check projection
+    # ===========================================================================
     print("\n[Phase 3] Projection sanity check...")
     if base_result['n_samples'] > 0:
+        # Probe img_size from LPB video if available, otherwise assume 140.
+        img_size_probe = 140
         eef0 = base_result['eef_traj'][0, 0]
-        px = _project_to_camera(eef0.reshape(1, 3), lpb_env, render_obs_key)[0]
-        print(f"  world {eef0} -> px {px} (camera={render_obs_key})")
-        # Soft warning (not hard assert) — out-of-frame projection of eef0
-        # doesn't necessarily break the video; the renderer skips invalid pts.
-        if not (0 <= px[0] < 140 and 0 <= px[1] < 140):
+        px = _project_to_camera(eef0.reshape(1, 3), lpb_env, render_obs_key,
+                                img_size=img_size_probe)[0]
+        print(f"  world {eef0} -> px {px} (camera={render_obs_key}, assumed {img_size_probe}px)")
+        if not (0 <= px[0] < img_size_probe and 0 <= px[1] < img_size_probe):
             print(f"  WARN: eef0 projects out of frame; overlay will be sparse.")
         else:
             print(f"  OK")
     else:
         print("  SKIP: base rollout produced 0 samples")
 
-    # ---- Phase 4: save rollout data ----
+    # ===========================================================================
+    # Phase 4: save rollout data
+    # ===========================================================================
     print("\n[Phase 4] Saving rollout data...")
     np.savez_compressed(
         os.path.join(cfg.output_dir, 'rollout_data.npz'),
+        seed_used=seed_used,
+        find_divergent_seed=find_divergent,
         base_eef=base_result['eef_traj'],
         base_actions=base_result['actions'],
         base_success=base_result['success'],
@@ -696,27 +773,32 @@ def main(cfg: DictConfig):
         lpb_success_step=lpb_result['success_step'],
     )
 
-    # ---- Phase 5: compose video (LPB driving + base overlay) ----
+    # ===========================================================================
+    # Phase 5: compose video (LPB driving + base overlay)
+    # ===========================================================================
     print("\n[Phase 5] Composing video: LPB driving + base overlay...")
-    if lpb_result['video_path'] is None or not os.path.exists(lpb_result['video_path']):
-        print(f"[Phase 5] SKIP: LPB did not produce a video "
-              f"(video_path={lpb_result['video_path']})")
+    lpb_video = lpb_result.get('video_path')
+    if not lpb_video or not os.path.exists(lpb_video):
+        print(f"[Phase 5] SKIP: LPB did not produce a video (video_path={lpb_video})")
     else:
         _make_video(
-            lpb_video_path=lpb_result['video_path'],
+            lpb_video_path=lpb_video,
             lpb_n_chunks=lpb_result['n_steps'],
             base_eef_traj=base_result['eef_traj'],
-            env=lpb_env,  # use LPB's env for camera projection (fixed cameras)
+            env=lpb_env,
             render_obs_key=render_obs_key,
             cfg=cfg,
             output_path=os.path.join(cfg.output_dir, 'lpb_driving_base_overlay.mp4'),
         )
 
-    # ---- Summary ----
+    # ===========================================================================
+    # Summary
+    # ===========================================================================
     print("\n" + "=" * 60)
     print("DONE")
     print(f"  Output dir: {cfg.output_dir}")
-    print(f"  - lpb_driver.mp4 (raw LPB rollout, {lpb_result['n_steps']} chunks)")
+    print(f"  Seed used: {seed_used}  (find_divergent_seed={find_divergent})")
+    print(f"  - lpb_driver*.mp4 (raw LPB rollout, {lpb_result['n_steps']} chunks)")
     print(f"  - lpb_driving_base_overlay.mp4 (LPB video + base eef overlay)")
     print(f"  - rollout_data.npz")
     print(f"  LPB  success: {lpb_result['success']} @ step {lpb_result['success_step']}")
