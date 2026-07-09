@@ -1,0 +1,31 @@
+# Config for compare_lpb_vs_base.py — generates two comparison videos.
+# See docs/superpowers/specs/2026-07-06-lpb-vs-base-comparison-design.md
+
+hydra:
+  run:
+    dir: .
+
+# ---- Reused from eval_transport.yaml ----
+dynamics_model_checkpoint: '/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/outputs/2026.06.16/11.15.55_transport/checkpoints/model_60.pth'
+policy_checkpoint: '/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/outputs/base_policy_6_15/checkpoints/270.ckpt'
+guidance_start_timestep: 10
+guidance_scale: 0.2
+threshold: 2.8
+n_action_steps: 15                 # per-env chunk size (transport=15; square/tool_hang/libero typically 8)
+demo_dataset_path: '/inspire/hdd/project/robot-dna/baojiachun-CZXS25130063/lpb/data/transport/data/expert_demonstration/transport_ph_demo_v141_20_perc.hdf5'
+device: "cuda"
+planner_target: 'dyn_model.planner.Planner'
+
+# ---- Script-specific ----
+compare_seed: 100000              # initial state seed (matches eval test_start_seed format)
+max_steps: 700                    # rollout cap in chunks (matches task.env_runner.max_steps)
+video_fps: 20
+video_frame_scale: 2              # upscale each camera image (transport 140 -> 280)
+output_dir: 'data/compare_lpb_vs_base'
+
+# ---- Divergent-seed search ----
+# When true, search seeds starting from compare_seed, increment by 1 until
+# LPB succeeds AND base fails, then visualize that trajectory. Useful for
+# showing cases where LPB's guidance actually matters.
+find_divergent_seed: false
+max_seed_search: 50               # cap on number of seeds to try before giving up
