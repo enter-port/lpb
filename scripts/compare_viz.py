@@ -1,10 +1,15 @@
 """
 compare_viz — visualize LPB vs base policy divergence.
 
-Generates ONE video: LPB (base + dynamics + classifier guidance) drives the
-env from a seed-initialized state (recorded at full env fps via the standard
-`VideoRecordingWrapper`), with the BASE policy's eef trajectory overlaid as a
-colored polyline (past = solid, future = dashed).
+Main output: ONE composited video where LPB (base + dynamics + classifier
+guidance) drives the env from a seed-initialized state (recorded at full env
+fps via the standard `VideoRecordingWrapper`), with the BASE policy's eef
+trajectory overlaid as a colored polyline (past = solid, future = dashed).
+
+Also saved as raw outputs (no overlay):
+  - base_driver*.mp4 — the base policy's own rollout video
+  - lpb_driver*.mp4  — the LPB policy's own rollout video
+so you can inspect each policy's actual behavior independently.
 
 Two modes:
   - Default (find_divergent_seed=false): use cfg.compare_seed directly.
@@ -16,9 +21,9 @@ Two modes:
 Cross-env compatibility: works for any task (transport, square, tool_hang,
 libero, ...) given a matching compare_<env>.yaml. The env-specific fields
 are read from the policy checkpoint's task config or the compare yaml:
-  - render_obs_key  ← cfg.task.env_runner.render_obs_key
-  - abs_action      ← cfg.task.env_runner.abs_action
-  - n_action_steps  ← cfg.n_action_steps (top-level, in compare_<env>.yaml)
+  - render_obs_key  <- cfg.task.env_runner.render_obs_key
+  - abs_action      <- cfg.task.env_runner.abs_action
+  - n_action_steps  <- cfg.n_action_steps (top-level, in compare_<env>.yaml)
 
 Usage:
     python scripts/compare_viz.py --config-name=compare_transport
@@ -604,22 +609,29 @@ def _try_one_seed(cfg, cfg_task, base_policy, lpb_policy, abs_action: bool,
     Strategy: run base first (cheaper, no guidance). If base succeeded, skip
     (we need base to fail). Only run LPB if base failed.
 
+    Both rollouts record videos so the user can inspect the actual trajectories
+    for the chosen seed. On non-divergent seeds, both video files are deleted
+    to keep the output dir clean.
+
     On success, the LPB env is RETAINED (caller needs it for camera projection
-    during Phase 5). On failure, envs are cleaned up.
+    during Phase 5). On failure, envs + videos are cleaned up.
     """
     cfg.compare_seed = seed  # _run_rollout reads this
 
-    # ---- base rollout (no video) ----
+    # ---- base rollout (with video) ----
     base_env, _, _, _, _ = _build_env(cfg_task, cfg)
+    base_video_path = os.path.join(output_dir, f'base_driver_s{seed}.mp4')
     base_result = _run_rollout(
         base_policy, base_env, cfg, use_guidance=False,
-        label=f'base_s{seed}', abs_action=abs_action, video_path=None,
+        label=f'base_s{seed}', abs_action=abs_action, video_path=base_video_path,
     )
     del base_env
     torch.cuda.empty_cache()
 
     if base_result['success']:
         print(f"[search:seed={seed}] base SUCCEEDED -> skip (need base to fail)")
+        if os.path.exists(base_video_path):
+            os.remove(base_video_path)
         return None
 
     # ---- base failed; try LPB (with video) ----
@@ -638,14 +650,16 @@ def _try_one_seed(cfg, cfg_task, base_policy, lpb_policy, abs_action: bool,
             'lpb_result': lpb_result,
             'lpb_env': lpb_env,           # retained for Phase 5 projection
             'lpb_video_path': lpb_video_path,
+            'base_video_path': base_video_path,
         }
 
-    # both failed; cleanup
+    # both failed; cleanup both videos
     print(f"[search:seed={seed}] both failed -> continue searching")
     del lpb_env
     torch.cuda.empty_cache()
-    if os.path.exists(lpb_video_path):
-        os.remove(lpb_video_path)
+    for p in (lpb_video_path, base_video_path):
+        if os.path.exists(p):
+            os.remove(p)
     return None
 
 
@@ -719,9 +733,10 @@ def main(cfg: DictConfig):
         print(f"[run] render_obs_key={render_obs_key}, abs_action={abs_action}")
 
         base_env, _, _, _, _ = _build_env(cfg_task, cfg)
+        base_video_path = os.path.join(cfg.output_dir, 'base_driver.mp4')
         base_result = _run_rollout(
             base_policy, base_env, cfg, use_guidance=False,
-            label='base', abs_action=abs_action, video_path=None,
+            label='base', abs_action=abs_action, video_path=base_video_path,
         )
         del base_policy, base_env
         torch.cuda.empty_cache()
@@ -798,6 +813,7 @@ def main(cfg: DictConfig):
     print("DONE")
     print(f"  Output dir: {cfg.output_dir}")
     print(f"  Seed used: {seed_used}  (find_divergent_seed={find_divergent})")
+    print(f"  - base_driver*.mp4 (raw base rollout, {base_result['n_steps']} chunks)")
     print(f"  - lpb_driver*.mp4 (raw LPB rollout, {lpb_result['n_steps']} chunks)")
     print(f"  - lpb_driving_base_overlay.mp4 (LPB video + base eef overlay)")
     print(f"  - rollout_data.npz")
