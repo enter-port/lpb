@@ -56,6 +56,35 @@ _CONFIG_DIR = os.path.join(_REPO_ROOT, "dyn_model", "conf", "planner")
 
 
 # ===========================================================================
+# Extra camera angles — record ADDITIONAL videos from these viewpoints,
+# alongside the main render_obs_key video. Edit here, no need to touch yaml.
+# ===========================================================================
+# Each camera produces its own base_driver_<cam>.mp4, lpb_driver_<cam>.mp4,
+# and lpb_driving_base_overlay_<cam>.mp4 in the output dir, in ADDITION to
+# the main (shouldercamera0) set. So with EXTRA_RENDER_KEYS=('agentview_image',)
+# you get 6 videos total: 3 from shouldercamera0 + 3 from agentview.
+#
+# Cameras must exist in the env XML (transport_model_file_1.4.xml for
+# Transport) and be FIXED in world (not eye-in-hand, which translates with
+# the arm and would make the world-coord overlay projection incoherent).
+#
+# Transport options: frontview_image, birdview_image, agentview_image,
+# sideview_image, shouldercamera1_image (shouldercamera0_image is the main
+# view; listing it here would just duplicate).
+#
+# IMPORTANT: this ONLY affects the rendered videos. The policy's obs inputs
+# are unchanged (still the 4 cameras it was trained on). We bypass
+# RobomimicImageWrapper and call MuJoCo's offscreen render directly, so the
+# extra cameras don't need to be in shape_meta.
+#
+# Note: extra videos are rendered at ONE FRAME PER CHUNK (vs the main video's
+# every-few-env-steps via VideoRecordingWrapper). So they play ~7-15x faster
+# than real time. Fine for trajectory visualization; would need a custom
+# wrapper to match the main video's fps.
+EXTRA_RENDER_KEYS = ('agentview_image',)
+
+
+# ===========================================================================
 # Policy loaders
 # ===========================================================================
 
@@ -211,7 +240,8 @@ def _build_env(cfg_task, cfg: DictConfig):
 # ===========================================================================
 
 def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
-                 abs_action: bool, video_path: Optional[str] = None) -> Dict:
+                 abs_action: bool, video_path: Optional[str] = None,
+                 extra_render_keys: Tuple[str, ...] = ()) -> Dict:
     """Run a rollout. If `video_path` is set, env records at full fps to that
     MP4 via VideoRecordingWrapper (file_path must be assigned BEFORE reset,
     since reset() stops any prior recorder).
@@ -222,6 +252,11 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
     One env.step() consumes `n_action_steps` underlying robosuite steps; we
     treat that as one "chunk" / decision step. cfg.max_steps caps chunks.
 
+    `extra_render_keys` (optional): for each camera obs-key in this tuple
+    (e.g. 'agentview_image'), render ONE frame per chunk via MuJoCo's
+    offscreen context (bypassing RobomimicImageWrapper, so the policy's obs
+    inputs are completely unaffected). Frames are returned in `extra_frames`.
+
     Returns a dict with keys:
         eef_traj      (T, 2, 3) float  - robot0/robot1 eef xyz per chunk
         actions       (T, action_dim_env) float
@@ -230,6 +265,7 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
         n_steps       int  - chunks executed
         n_samples     int  - == eef_traj.shape[0]
         video_path    Optional[str]
+        extra_frames  Dict[str, List[np.ndarray]] - {cam_key: [(H,W,3) uint8]}
     """
     from diffusion_policy.model.common.rotation_transformer import RotationTransformer
 
@@ -263,6 +299,7 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
 
     eef_list: List[np.ndarray] = []
     actions_list: List[np.ndarray] = []
+    extra_frames: Dict[str, List[np.ndarray]] = {k: [] for k in extra_render_keys}
     success = False
     success_step = -1
     n_chunks = 0
@@ -296,6 +333,21 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
         eef_list.append(eef)
         actions_list.append(env_action.copy())
 
+        # ---- render extra cameras at this chunk's end-state ----
+        # One frame per chunk per camera. Sim state is current (env.step just
+        # returned), so we can render any camera in the XML. Bypasses
+        # RobomimicImageWrapper entirely; policy's obs inputs are untouched.
+        for cam_key in extra_render_keys:
+            try:
+                frame = _render_extra_camera(env, cam_key)
+                extra_frames[cam_key].append(frame)
+            except Exception as e:
+                # Don't fail the whole rollout if one extra render errors
+                # (e.g., camera name typo, EGL hiccup). Just log and skip.
+                print(f"[rollout:{label}] WARN: extra render '{cam_key}' failed at "
+                      f"chunk {chunk_idx}: {e}")
+                extra_frames[cam_key].append(None)
+
         try:
             cur_success = bool(env.env.env.get_success_label())
         except (AttributeError, RuntimeError) as e:
@@ -319,7 +371,8 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
     actions = np.stack(actions_list) if actions_list else np.zeros((0, 14), dtype=np.float32)
 
     print(f"[rollout:{label}] done. n_chunks={n_chunks}, success={success}, "
-          f"success_step={success_step}")
+          f"success_step={success_step}, extra_frames="
+          f"{ {k: len([f for f in v if f is not None]) for k, v in extra_frames.items()} }")
     return {
         'eef_traj': eef_traj,
         'actions': actions,
@@ -328,7 +381,89 @@ def _run_rollout(policy, env, cfg, use_guidance: bool, label: str,
         'n_steps': n_chunks,
         'n_samples': len(eef_list),
         'video_path': final_video_path,
+        'extra_frames': extra_frames,
     }
+
+
+# ===========================================================================
+# Extra-camera helpers — render from any MuJoCo camera without touching obs
+# ===========================================================================
+
+def _render_extra_camera(env, camera_obs_key: str, img_size: int = 140) -> np.ndarray:
+    """Render the current sim state from a specific MuJoCo camera, bypassing
+    RobomimicImageWrapper.
+
+    Why bypass the wrapper: `RobomimicImageWrapper.render()` returns
+    `render_cache`, which is populated from `raw_obs[render_obs_key]` during
+    the last `get_observation()` call. The raw_obs only contains cameras that
+    are in shape_meta (4 for Transport). agentview / birdview etc. aren't in
+    shape_meta, so they're not in raw_obs and the wrapper can't render them.
+
+    This helper walks down to the underlying mujoco sim and calls
+    `sim._render_context.offscreen.render(W, H, cam_id)` directly. The sim
+    knows about ALL cameras in the env XML, regardless of shape_meta.
+
+    Args:
+        env: wrapped env (MultiStepWrapper → ... → robosuite env).
+        camera_obs_key: obs key like 'agentview_image' (will strip '_image'
+            to get the MuJoCo camera name).
+        img_size: render output is img_size x img_size.
+
+    Returns:
+        np.ndarray (img_size, img_size, 3) uint8.
+    """
+    node = env
+    sim = None
+    for _ in range(8):
+        if hasattr(node, 'sim') and node.sim is not None:
+            sim = node.sim
+            break
+        if not hasattr(node, 'env'):
+            break
+        node = node.env
+    if sim is None:
+        raise RuntimeError(
+            f"Could not find `sim` on the env wrapper stack to render "
+            f"extra camera '{camera_obs_key}'.")
+
+    cam_name = camera_obs_key.replace('_image', '')
+    cam_id = sim.model.camera_name2id(cam_name)
+
+    # mujoco-py 2.x: offscreen.render(W, H, cam_id) -> (H, W, 3) uint8
+    # (some versions return (3, H, W); we normalize below).
+    img = sim._render_context.offscreen.render(img_size, img_size, cam_id)
+    img = np.asarray(img)
+    if img.ndim == 3 and img.shape[0] == 3 and img.shape[-1] != 3:
+        # channels-first (3, H, W) -> channels-last (H, W, 3)
+        img = np.moveaxis(img, 0, -1)
+    if img.dtype != np.uint8:
+        img = np.clip(img, 0, 255).astype(np.uint8)
+    return img
+
+
+def _save_frames_to_mp4(frames: List[np.ndarray], output_path: str, fps: int):
+    """Write a list of (H, W, 3) uint8 frames to an MP4 via imageio.
+
+    Skips None entries (failed extra renders) silently so a single bad frame
+    doesn't abort the whole video.
+    """
+    import imageio.v2 as imageio
+    n_valid = sum(1 for f in frames if f is not None)
+    if n_valid == 0:
+        print(f"[video] SKIP: no valid frames to write to {output_path}")
+        return
+    writer = imageio.get_writer(
+        output_path, fps=fps, codec='libx264',
+        quality=8, macro_block_size=1,
+    )
+    try:
+        for frame in frames:
+            if frame is None:
+                continue
+            writer.append_data(frame)
+    finally:
+        writer.close()
+    print(f"[video] wrote {output_path} ({n_valid} frames)")
 
 
 # ===========================================================================
@@ -624,6 +759,7 @@ def _try_one_seed(cfg, cfg_task, base_policy, lpb_policy, abs_action: bool,
     base_result = _run_rollout(
         base_policy, base_env, cfg, use_guidance=False,
         label=f'base_s{seed}', abs_action=abs_action, video_path=base_video_path,
+        extra_render_keys=EXTRA_RENDER_KEYS,
     )
     del base_env
     torch.cuda.empty_cache()
@@ -640,6 +776,7 @@ def _try_one_seed(cfg, cfg_task, base_policy, lpb_policy, abs_action: bool,
     lpb_result = _run_rollout(
         lpb_policy, lpb_env, cfg, use_guidance=True,
         label=f'lpb_s{seed}', abs_action=abs_action, video_path=lpb_video_path,
+        extra_render_keys=EXTRA_RENDER_KEYS,
     )
 
     if lpb_result['success']:
@@ -737,6 +874,7 @@ def main(cfg: DictConfig):
         base_result = _run_rollout(
             base_policy, base_env, cfg, use_guidance=False,
             label='base', abs_action=abs_action, video_path=base_video_path,
+            extra_render_keys=EXTRA_RENDER_KEYS,
         )
         del base_policy, base_env
         torch.cuda.empty_cache()
@@ -748,6 +886,7 @@ def main(cfg: DictConfig):
         lpb_result = _run_rollout(
             lpb_policy, lpb_env, cfg, use_guidance=True,
             label='lpb', abs_action=abs_action, video_path=lpb_video_path,
+            extra_render_keys=EXTRA_RENDER_KEYS,
         )
         del lpb_policy
         torch.cuda.empty_cache()
@@ -789,7 +928,7 @@ def main(cfg: DictConfig):
     )
 
     # ===========================================================================
-    # Phase 5: compose video (LPB driving + base overlay)
+    # Phase 5: compose video (LPB driving + base overlay) — main render_obs_key
     # ===========================================================================
     print("\n[Phase 5] Composing video: LPB driving + base overlay...")
     lpb_video = lpb_result.get('video_path')
@@ -807,6 +946,53 @@ def main(cfg: DictConfig):
         )
 
     # ===========================================================================
+    # Phase 5b: extra-camera videos + overlays (one set per EXTRA_RENDER_KEYS)
+    # ===========================================================================
+    # For each extra camera, render 3 files:
+    #   base_driver_<cam>.mp4                  — raw base rollout from <cam>
+    #   lpb_driver_<cam>.mp4                   — raw LPB rollout from <cam>
+    #   lpb_driving_base_overlay_<cam>.mp4     — LPB <cam> video + base eef overlay
+    # (mirrors the 3-file main-video output, just from a different angle).
+    # Naming follows the main set: divergent-search mode keeps the _s{seed}
+    # suffix on the main driver files; extra files always use the plain name
+    # since the seed is already recorded in rollout_data.npz.
+    for cam_key in EXTRA_RENDER_KEYS:
+        cam_short = cam_key.replace('_image', '')
+        print(f"\n[Phase 5b:{cam_short}] saving extra-camera videos...")
+
+        base_frames = base_result.get('extra_frames', {}).get(cam_key, [])
+        lpb_frames = lpb_result.get('extra_frames', {}).get(cam_key, [])
+
+        if base_frames:
+            _save_frames_to_mp4(
+                base_frames,
+                os.path.join(cfg.output_dir, f'base_driver_{cam_short}.mp4'),
+                cfg.video_fps,
+            )
+        else:
+            print(f"[Phase 5b:{cam_short}] no base frames, skipping base_driver_{cam_short}.mp4")
+
+        if lpb_frames:
+            lpb_cam_path = os.path.join(cfg.output_dir, f'lpb_driver_{cam_short}.mp4')
+            _save_frames_to_mp4(lpb_frames, lpb_cam_path, cfg.video_fps)
+
+            # Overlay: same _make_video call as Phase 5, but with this camera's
+            # video as background and projection using this camera's params.
+            _make_video(
+                lpb_video_path=lpb_cam_path,
+                lpb_n_chunks=lpb_result['n_steps'],
+                base_eef_traj=base_result['eef_traj'],
+                env=lpb_env,
+                render_obs_key=cam_key,
+                cfg=cfg,
+                output_path=os.path.join(cfg.output_dir,
+                                         f'lpb_driving_base_overlay_{cam_short}.mp4'),
+            )
+        else:
+            print(f"[Phase 5b:{cam_short}] no LPB frames, skipping "
+                  f"lpb_driver_{cam_short}.mp4 and overlay")
+
+    # ===========================================================================
     # Summary
     # ===========================================================================
     print("\n" + "=" * 60)
@@ -816,6 +1002,10 @@ def main(cfg: DictConfig):
     print(f"  - base_driver*.mp4 (raw base rollout, {base_result['n_steps']} chunks)")
     print(f"  - lpb_driver*.mp4 (raw LPB rollout, {lpb_result['n_steps']} chunks)")
     print(f"  - lpb_driving_base_overlay.mp4 (LPB video + base eef overlay)")
+    for cam_key in EXTRA_RENDER_KEYS:
+        cam_short = cam_key.replace('_image', '')
+        print(f"  - base_driver_{cam_short}.mp4 / lpb_driver_{cam_short}.mp4 / "
+              f"lpb_driving_base_overlay_{cam_short}.mp4  (extra angle)")
     print(f"  - rollout_data.npz")
     print(f"  LPB  success: {lpb_result['success']} @ step {lpb_result['success_step']}")
     print(f"  Base success: {base_result['success']} @ step {base_result['success_step']}")
